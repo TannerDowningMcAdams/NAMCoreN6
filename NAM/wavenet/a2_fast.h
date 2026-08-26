@@ -19,6 +19,7 @@
 
   #include "../model_config.h"
   #include "json.hpp"
+  #include "model.h"
 
 namespace nam
 {
@@ -48,9 +49,31 @@ inline constexpr std::array<int, kNumLayers> kDilations = {
 /// \return true if every architectural knob matches the A2 signature exactly.
 bool is_a2_shape(const nlohmann::json& config, int* channels);
 
+/// \brief Strict detector operating on an already-parsed WaveNetConfig.
+///
+/// The JSON overload above can only serve loaders that have a JSON document.
+/// A binary loader (.namb) builds a WaveNetConfig directly and hands it to
+/// create_dsp(), which does no shape checking -- so without this overload an
+/// A2 model loaded from .namb silently runs the generic WaveNet.
+///
+/// This inspects the typed parameters the model will actually be built from,
+/// rather than re-deriving the JSON predicates in binary terms. That keeps the
+/// two entry points from drifting: a field the binary format gains later cannot
+/// bypass the check, because the check reads the constructed config.
+///
+/// \param config   Parsed WaveNet configuration.
+/// \param channels Out-param set to 3 (A2-Lite) or 8 (A2-Full) on match.
+/// \return true if every architectural knob matches the A2 signature exactly.
+bool is_a2_shape(const WaveNetConfig& config, int* channels);
+
 /// \brief Build a ModelConfig that instantiates the A2 fast path.
 /// \pre is_a2_shape(config, ...) returned true.
 std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config, double sampleRate);
+
+/// \brief Build a ModelConfig that instantiates the A2 fast path.
+/// \param channels 3 (A2-Lite) or 8 (A2-Full), as reported by is_a2_shape().
+/// \pre is_a2_shape() returned true and produced this channel count.
+std::unique_ptr<ModelConfig> create_a2_fast_config(int channels);
 
 } // namespace a2_fast
 } // namespace wavenet

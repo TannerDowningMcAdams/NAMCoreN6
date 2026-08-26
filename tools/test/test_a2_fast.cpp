@@ -15,6 +15,7 @@
   #include <random>
   #include <string>
   #include <utility>
+  #include <typeinfo>
   #include <vector>
 
   #include "json.hpp"
@@ -453,6 +454,326 @@ void test_process_realtime_safe_full()
   test_process_realtime_safe(8);
 }
 
+
+// =============================================================================
+// Typed detector: is_a2_shape(const WaveNetConfig&, int*)
+//
+// The JSON overload can only serve loaders that have a JSON document.
+// wavenet::create_config() consults it, but create_dsp() does not -- so a loader
+// that builds a WaveNetConfig directly (the .namb binary loader) reaches the
+// generic WaveNet no matter what shape the model is. These cover the typed
+// overload that closes that gap.
+//
+// The parity test is the one that matters long-term: it pins the two detectors
+// to the same verdict, so a predicate added to one and not the other fails here
+// rather than silently changing which class a .namb model gets.
+// =============================================================================
+
+namespace
+{
+
+// Parse the shared JSON fixture into the typed config a binary loader would
+// otherwise have built by hand.
+nam::wavenet::WaveNetConfig parse_a2_config(int channels)
+{
+  return nam::wavenet::parse_config_json(build_a2_config(channels), 48000.0);
+}
+
+// Minimal stand-in for a conditioning model. nam::DSP has no pure virtuals, so
+// this needs no behaviour -- the detector only tests the pointer for null, and
+// building a real nested model here would couple the test to another
+// architecture's weight layout.
+class StubConditionDSP : public nam::DSP
+{
+public:
+  StubConditionDSP()
+  : nam::DSP(/*in_channels=*/1, /*out_channels=*/1, /*expected_sample_rate=*/48000.0)
+  {
+  }
+};
+
+// Both detectors must agree on every config, accepted or rejected.
+void assert_detectors_agree(const nlohmann::json& cfg, const char* what)
+{
+  int json_ch = -1;
+  int typed_ch = -2;
+  const bool json_match = nam::wavenet::a2_fast::is_a2_shape(cfg, &json_ch);
+
+  auto typed = nam::wavenet::parse_config_json(cfg, 48000.0);
+  const bool typed_match = nam::wavenet::a2_fast::is_a2_shape(typed, &typed_ch);
+
+  if (json_match != typed_match)
+  {
+    std::cerr << "Detector disagreement on " << what << ": json=" << json_match << " typed=" << typed_match
+              << std::endl;
+    assert(false);
+  }
+  if (json_match)
+  {
+    assert(json_ch == typed_ch);
+  }
+}
+
+} // namespace
+
+void test_typed_detector_matches_lite()
+{
+  auto cfg = parse_a2_config(3);
+  int ch = 0;
+  assert(nam::wavenet::a2_fast::is_a2_shape(cfg, &ch));
+  assert(ch == 3);
+}
+
+void test_typed_detector_matches_full()
+{
+  auto cfg = parse_a2_config(8);
+  int ch = 0;
+  assert(nam::wavenet::a2_fast::is_a2_shape(cfg, &ch));
+  assert(ch == 8);
+}
+
+// The check that motivated the typed overload. A condition DSP carries its own
+// weights, so the parent weight stream is byte-identical with or without one --
+// nothing downstream of the detector can catch the substitution, and the fast
+// path has no conditioning stage. A binary loader attaches condition_dsp after
+// parsing the layer arrays, so this has to hold on the fully populated config,
+// not on a partially built one.
+void test_typed_detector_rejects_condition_dsp()
+{
+  auto cfg = parse_a2_config(8);
+  assert(nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr)); // accepted before
+  cfg.condition_dsp = std::make_unique<StubConditionDSP>();
+  assert(!nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr)); // rejected after
+}
+
+void test_typed_detector_rejects_post_stack_head()
+{
+  auto cfg = parse_a2_config(3);
+  assert(nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr));
+  cfg.with_head = true;
+  assert(!nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr));
+}
+
+void test_typed_detector_rejects_wrong_channels()
+{
+  auto j = build_a2_config(3);
+  j["layers"][0]["channels"] = 4;
+  j["layers"][0]["bottleneck"] = 4;
+  auto cfg = nam::wavenet::parse_config_json(j, 48000.0);
+  assert(!nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr));
+}
+
+void test_typed_detector_rejects_wrong_kernel_sizes()
+{
+  auto j = build_a2_config(8);
+  j["layers"][0]["kernel_sizes"][0] = 7;
+  auto cfg = nam::wavenet::parse_config_json(j, 48000.0);
+  assert(!nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr));
+}
+
+void test_typed_detector_rejects_gating()
+{
+  auto j = build_a2_config(3);
+  j["layers"][0]["gating_mode"][0] = "gated";
+  j["layers"][0]["secondary_activation"][0] = {{"type", "Sigmoid"}};
+  auto cfg = nam::wavenet::parse_config_json(j, 48000.0);
+  assert(!nam::wavenet::a2_fast::is_a2_shape(cfg, nullptr));
+}
+
+// Parity across the whole fixture set. Any predicate present in one detector and
+// missing from the other shows up here.
+void test_typed_detector_agrees_with_json()
+{
+  assert_detectors_agree(build_a2_config(3), "A2-Lite");
+  assert_detectors_agree(build_a2_config(8), "A2-Full");
+
+  {
+    auto j = build_a2_config(8);
+    j["head_scale"] = 0.0042f;
+    assert_detectors_agree(j, "nonstandard head_scale");
+  }
+  {
+    auto j = build_a2_config(3);
+    j["layers"][0]["channels"] = 4;
+    j["layers"][0]["bottleneck"] = 4;
+    assert_detectors_agree(j, "wrong channels");
+  }
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["kernel_sizes"][0] = 7;
+    assert_detectors_agree(j, "wrong kernel_sizes");
+  }
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["dilations"][5] = 99;
+    assert_detectors_agree(j, "wrong dilations");
+  }
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["activation"][0] = {{"type", "Tanh"}};
+    assert_detectors_agree(j, "wrong activation");
+  }
+  {
+    auto j = build_a2_config(3);
+    j["layers"][0]["gating_mode"][0] = "gated";
+    j["layers"][0]["secondary_activation"][0] = {{"type", "Sigmoid"}};
+    assert_detectors_agree(j, "gating");
+  }
+  // NOTE: legacy `gated` is deliberately absent from this list. See
+  // test_typed_detector_diverges_on_contradictory_gating below.
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["layer1x1"] = {{"active", false}, {"groups", 1}};
+    assert_detectors_agree(j, "layer1x1 inactive");
+  }
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["head1x1"] = {{"active", true}, {"out_channels", 8}, {"groups", 1}};
+    assert_detectors_agree(j, "head1x1 active");
+  }
+  {
+    auto j = build_a2_config(3);
+    j["layers"][0]["conv_post_film"] = {{"active", true}, {"shift", true}, {"groups", 1}};
+    assert_detectors_agree(j, "FiLM active");
+  }
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["groups_input"] = 2;
+    assert_detectors_agree(j, "grouped input conv");
+  }
+  {
+    auto j = build_a2_config(8);
+    j["layers"][0]["head"] = {{"out_channels", 1}, {"kernel_size", 8}, {"bias", true}};
+    assert_detectors_agree(j, "wrong head kernel_size");
+  }
+}
+
+// The one config the two detectors legitimately disagree on, pinned here so the
+// divergence is a documented property rather than a surprise.
+//
+// A layer carrying BOTH gating_mode (all "none") and the legacy gated=true is
+// self-contradictory. parse_config_json resolves it by precedence: when
+// gating_mode is present the legacy boolean is never read (model.cpp), so the
+// parsed model has no gating and the fast path is a valid substitution for it.
+//
+//   JSON detector  rejects  - it tests gated unconditionally, without modelling
+//                             the precedence rule. Conservative: a missed
+//                             optimisation, never wrong audio.
+//   Typed detector accepts  - correct about what the model actually does.
+//
+// The typed overload cannot reproduce the JSON verdict even if we wanted it to:
+// `gated` does not survive parsing, so by the time a WaveNetConfig exists the
+// field is gone. This is the direction that is safe to differ in -- the reverse
+// (typed accepting something whose fast path would sound different) is what
+// test_typed_detector_rejects_condition_dsp guards.
+void test_typed_detector_diverges_on_contradictory_gating()
+{
+  auto j = build_a2_config(3);
+  j["layers"][0]["gated"] = true;
+
+  assert(!nam::wavenet::a2_fast::is_a2_shape(j, nullptr)); // JSON: conservative reject
+
+  auto typed = nam::wavenet::parse_config_json(j, 48000.0);
+  int ch = 0;
+  assert(nam::wavenet::a2_fast::is_a2_shape(typed, &ch)); // typed: accept
+  assert(ch == 3);
+
+  // The accept is justified: the parser really did produce an ungated model.
+  for (const auto& gm : typed.layer_array_params[0].gating_modes)
+  {
+    assert(gm == nam::wavenet::GatingMode::NONE);
+  }
+}
+
+// The channel-count overload is what a binary loader calls once the typed
+// detector has reported a match. It must refuse anything the fast path has no
+// template instantiation for, rather than handing back an unusable config.
+void test_create_a2_fast_config_from_channels()
+{
+  for (const int ch : {3, 8})
+  {
+    auto cfg = nam::wavenet::a2_fast::create_a2_fast_config(ch);
+    assert(cfg != nullptr);
+  }
+
+  bool threw = false;
+  try
+  {
+    (void)nam::wavenet::a2_fast::create_a2_fast_config(4);
+  }
+  catch (const std::runtime_error&)
+  {
+    threw = true;
+  }
+  assert(threw);
+}
+
+// End-to-end, with no JSON anywhere in the substitution path: a config reached
+// the way a binary loader reaches it must instantiate A2FastModel rather than
+// the generic WaveNet, and must stay numerically faithful to it. This is the
+// property that was broken -- a2_probe reported GENERIC_WAVENET for .namb on a
+// model that .nam ran as A2_FAST.
+void test_typed_detector_selects_fast_path(int channels)
+{
+  auto wc = parse_a2_config(channels);
+
+  int ch = 0;
+  assert(nam::wavenet::a2_fast::is_a2_shape(wc, &ch));
+  assert(ch == channels);
+
+  auto fast_config = nam::wavenet::a2_fast::create_a2_fast_config(ch);
+  const auto weights = make_deterministic_weights(a2_weight_count(channels), 0x5EED);
+
+  auto fast = fast_config->create(weights, 48000.0);
+  std::unique_ptr<nam::DSP> generic(new nam::wavenet::WaveNet(
+    wc.in_channels, wc.layer_array_params, wc.head_scale, wc.with_head, std::nullopt, weights, nullptr, 48000.0));
+
+  assert(fast != nullptr);
+  assert(generic != nullptr);
+  // Distinct concrete types: the substitution actually happened.
+  assert(typeid(*fast) != typeid(*generic));
+
+  const int num_frames = 2048;
+  const int max_buffer = 256;
+  fast->Reset(48000.0, max_buffer);
+  generic->Reset(48000.0, max_buffer);
+
+  auto input = make_test_input(num_frames, 48000.0);
+  std::vector<NAM_SAMPLE> out_fast(num_frames, 0.0);
+  std::vector<NAM_SAMPLE> out_generic(num_frames, 0.0);
+
+  for (int offset = 0; offset < num_frames; offset += max_buffer)
+  {
+    const int n = std::min(max_buffer, num_frames - offset);
+    NAM_SAMPLE* in_ptr = input.data() + offset;
+    NAM_SAMPLE* f_ptr = out_fast.data() + offset;
+    NAM_SAMPLE* g_ptr = out_generic.data() + offset;
+    fast->process(&in_ptr, &f_ptr, n);
+    generic->process(&in_ptr, &g_ptr, n);
+  }
+
+  double max_diff = 0.0;
+  for (int i = 0; i < num_frames; i++)
+  {
+    max_diff = std::max(max_diff, std::abs(static_cast<double>(out_fast[i]) - static_cast<double>(out_generic[i])));
+  }
+
+  if (!(max_diff < 1e-5))
+  {
+    std::cerr << "test_typed_detector_selects_fast_path(" << channels << "): max_diff=" << max_diff << std::endl;
+    assert(false);
+  }
+}
+
+void test_typed_detector_selects_fast_path_lite()
+{
+  test_typed_detector_selects_fast_path(3);
+}
+
+void test_typed_detector_selects_fast_path_full()
+{
+  test_typed_detector_selects_fast_path(8);
+}
 } // namespace test_a2_fast
 
 #endif // NAM_ENABLE_A2_FAST

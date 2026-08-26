@@ -400,6 +400,19 @@ int main()
   test_a2_fast::test_cached_prewarm_full();
   test_a2_fast::test_process_realtime_safe_lite();
   test_a2_fast::test_process_realtime_safe_full();
+  // Typed detector: the path a binary (.namb) loader takes, which never sees JSON.
+  test_a2_fast::test_typed_detector_matches_lite();
+  test_a2_fast::test_typed_detector_matches_full();
+  test_a2_fast::test_typed_detector_rejects_condition_dsp();
+  test_a2_fast::test_typed_detector_rejects_post_stack_head();
+  test_a2_fast::test_typed_detector_rejects_wrong_channels();
+  test_a2_fast::test_typed_detector_rejects_wrong_kernel_sizes();
+  test_a2_fast::test_typed_detector_rejects_gating();
+  test_a2_fast::test_typed_detector_agrees_with_json();
+  test_a2_fast::test_typed_detector_diverges_on_contradictory_gating();
+  test_a2_fast::test_create_a2_fast_config_from_channels();
+  test_a2_fast::test_typed_detector_selects_fast_path_lite();
+  test_a2_fast::test_typed_detector_selects_fast_path_full();
 #endif
 
   std::cout << "Success!" << std::endl;

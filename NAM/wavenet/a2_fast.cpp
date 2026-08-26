@@ -983,14 +983,142 @@ bool is_a2_shape(const nlohmann::json& config, int* channels)
   return true;
 }
 
+bool is_a2_shape(const WaveNetConfig& config, int* channels)
+{
+  // Exactly one layer array
+  if (config.layer_array_params.size() != 1)
+    return false;
+
+  // No post-stack head
+  if (config.with_head || config.head_params.has_value())
+    return false;
+
+  // No conditioning DSP. Same reasoning as the JSON overload, and it matters more
+  // here: the condition DSP carries its own weights, so the parent weight stream is
+  // byte-identical with or without it. A binary loader cannot detect the difference
+  // from the weight blob, and the fast path has no conditioning stage -- it feeds
+  // the raw input as the condition. Missing this check does not fail loudly; it
+  // silently produces different audio than the model it replaces.
+  if (config.condition_dsp != nullptr)
+    return false;
+
+  // head_scale is not checked. The JSON overload requires the field only to keep
+  // the document schema-compatible with the generic parser; the value itself is
+  // always overwritten from the trailing weight, by the generic path and the fast
+  // path alike, so there is nothing here that could differ.
+
+  if (config.in_channels != 1)
+    return false;
+
+  const LayerArrayParams& la = config.layer_array_params[0];
+
+  if (la.input_size != 1)
+    return false;
+  if (la.condition_size != 1)
+    return false;
+
+  const int ch = la.channels;
+  if (ch != la.bottleneck)
+    return false;
+  if (ch != 3 && ch != 8)
+    return false;
+
+  // Per-layer kernel sizes and dilations must match the A2 pattern exactly.
+  if (la.kernel_sizes.size() != static_cast<size_t>(kNumLayers))
+    return false;
+  if (la.dilations.size() != static_cast<size_t>(kNumLayers))
+    return false;
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    if (la.kernel_sizes[i] != kKernelSizes[i])
+      return false;
+    if (la.dilations[i] != kDilations[i])
+      return false;
+  }
+
+  // Every layer LeakyReLU(0.01)
+  if (la.activation_configs.size() != static_cast<size_t>(kNumLayers))
+    return false;
+  for (const auto& a : la.activation_configs)
+  {
+    if (a.type != activations::ActivationType::LeakyReLU)
+      return false;
+    if (!a.negative_slope.has_value() || !close_to(*a.negative_slope, kLeakySlope))
+      return false;
+  }
+
+  // No gating anywhere. This subsumes the JSON overload's separate checks on the
+  // legacy `gated` boolean and on secondary_activation: the parser folds `gated`
+  // into gating_modes, and Layer only ever reads secondary_activation_config when
+  // the mode is GATED or BLENDED (detail.h), so under all-NONE gating a secondary
+  // activation cannot affect the model's output.
+  if (la.gating_modes.size() != static_cast<size_t>(kNumLayers))
+    return false;
+  for (const auto& gm : la.gating_modes)
+  {
+    if (gm != GatingMode::NONE)
+      return false;
+  }
+
+  // head1x1 inactive, layer1x1 active with groups=1
+  if (la.head1x1_params.active)
+    return false;
+  if (!la.layer1x1_params.active || la.layer1x1_params.groups != 1)
+    return false;
+
+  // Layer-array head rechannel: out_channels=1, k=16, dilation=1, bias=true
+  if (la.head_size != 1)
+    return false;
+  if (la.head_kernel_size != kHeadKernelSize)
+    return false;
+  if (la.head_dilation != 1)
+    return false;
+  if (!la.head_bias)
+    return false;
+
+  // No FiLM anywhere
+  if (la.conv_pre_film_params.active || la.conv_post_film_params.active || la.input_mixin_pre_film_params.active
+      || la.input_mixin_post_film_params.active || la.activation_pre_film_params.active
+      || la.activation_post_film_params.active || la._layer1x1_post_film_params.active
+      || la.head1x1_post_film_params.active)
+  {
+    return false;
+  }
+
+  // No grouped convolutions
+  if (la.groups_input != 1)
+    return false;
+  if (la.groups_input_mixin != 1)
+    return false;
+
+  // The JSON overload also rejects a "slimmable" field. There is no typed
+  // equivalent to check: a slimmable model never becomes a WaveNetConfig in the
+  // first place -- parse_config_json routes it to SlimmableWavenet, a different
+  // config type entirely, so it cannot reach this function.
+
+  if (channels)
+    *channels = ch;
+  return true;
+}
+
 std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config, double sampleRate)
 {
   (void)sampleRate;
   int ch = 0;
   if (!is_a2_shape(config, &ch))
     throw std::runtime_error("create_a2_fast_config: config does not match A2 shape");
+  return create_a2_fast_config(ch);
+}
+
+std::unique_ptr<ModelConfig> create_a2_fast_config(int channels)
+{
+  if (channels != 3 && channels != 8)
+  {
+    throw std::runtime_error("create_a2_fast_config: unsupported channel count "
+                             + std::to_string(channels));
+  }
   auto out = std::make_unique<A2FastConfig>();
-  out->channels = ch;
+  out->channels = channels;
   return out;
 }
 
