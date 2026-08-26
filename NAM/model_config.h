@@ -10,6 +10,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "status.h"
+
 #include "json.hpp"
 
 namespace nam
@@ -43,6 +45,8 @@ public:
   /// \return Unique pointer to a DSP object
   virtual std::unique_ptr<DSP> create(std::vector<float> weights, double sampleRate) = 0;
 };
+#if !defined(NAM_NO_JSON)
+
 
 /// \brief Function type for parsing a ModelConfig from JSON
 using ConfigParserFunction = std::function<std::unique_ptr<ModelConfig>(const nlohmann::json&, double)>;
@@ -103,6 +107,8 @@ struct ConfigParserHelper
   }
 };
 
+#endif // !NAM_NO_JSON
+
 /// \brief Construct a DSP object from a typed config, weights, and metadata
 ///
 /// This is the single construction path used by both JSON and binary loaders.
@@ -114,6 +120,17 @@ struct ConfigParserHelper
 std::unique_ptr<DSP> create_dsp(std::unique_ptr<ModelConfig> config, std::vector<float> weights,
                                 const ModelMetadata& metadata);
 
+/// \brief Construct a DSP object, reporting failure by status rather than by
+///        throwing.
+///
+/// Same construction path as the overload above; a config whose create() can
+/// fail without exceptions returns nullptr, which is surfaced here as a status.
+/// \param status Set to Status::Ok on success, otherwise the reason for failure.
+/// \return The DSP object, or nullptr on failure.
+std::unique_ptr<DSP> create_dsp(std::unique_ptr<ModelConfig> config, std::vector<float> weights,
+                                const ModelMetadata& metadata, Status& status);
+
+#if !defined(NAM_NO_JSON)
 /// \brief Parse a ModelConfig from a JSON architecture name and config block
 /// \param architecture Architecture name string (e.g., "WaveNet", "LSTM")
 /// \param config JSON config block for this architecture
@@ -121,5 +138,6 @@ std::unique_ptr<DSP> create_dsp(std::unique_ptr<ModelConfig> config, std::vector
 /// \return unique_ptr<ModelConfig>
 std::unique_ptr<ModelConfig> parse_model_config_json(const std::string& architecture, const nlohmann::json& config,
                                                      double sample_rate);
+#endif // !NAM_NO_JSON
 
 } // namespace nam

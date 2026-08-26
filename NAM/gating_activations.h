@@ -7,6 +7,7 @@
 #include <functional>
 #include <stdexcept>
 #include "activations.h"
+#include "status.h"
 #include "compiler.h"
 
 namespace nam
@@ -41,7 +42,7 @@ public:
   {
     if (num_channels <= 0)
     {
-      throw std::invalid_argument("GatingActivation: number of input channels must be positive");
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "GatingActivation: number of input channels must be positive");
     }
     // Initialize buffers with correct size
     // Note: current code copies column-by-column so we only need (num_channels, 1)

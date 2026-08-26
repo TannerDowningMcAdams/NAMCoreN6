@@ -26,6 +26,7 @@
   #include <Eigen/Dense>
 
   #include "../dsp.h"
+  #include "../status.h"
 
 namespace nam
 {
@@ -214,7 +215,12 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
 
   auto take = [&]() -> float {
     if (it == end)
-      throw std::runtime_error("A2FastModel: weight stream exhausted");
+    {
+      // Latched rather than thrown: this runs inside the constructor, which has
+      // no way to report failure. A2FastConfig::create() checks the latch once
+      // construction returns and discards the model.
+      NAM_FAIL_RET(nam::Status::ErrorWeightCount, "A2FastModel: weight stream exhausted", 0.0f);
+    }
     return *it++;
   };
 
@@ -279,7 +285,7 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
   {
     std::stringstream ss;
     ss << "A2FastModel: weight stream has " << std::distance(it, end) << " trailing bytes";
-    throw std::runtime_error(ss.str());
+    NAM_FAIL(nam::Status::ErrorWeightCount, ss.str());
   }
 }
 
@@ -692,7 +698,9 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
   {
     case 6: _layer_forward_k<6>(L, cond, num_frames); break;
     case 15: _layer_forward_k<15>(L, cond, num_frames); break;
-    default: throw std::runtime_error("A2FastModel: unexpected kernel_size " + std::to_string(L.kernel_size));
+    // Unreachable: is_a2_shape() admits only K in {6, 15}. Latch rather than
+    // throw so the audio path stays exception-free; the block is left silent.
+    default: NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: unexpected kernel_size"); break;
   }
 }
 
@@ -772,11 +780,24 @@ struct A2FastConfig : public ModelConfig
 
   std::unique_ptr<DSP> create(std::vector<float> weights, double sampleRate) override
   {
+    std::unique_ptr<DSP> out;
     if (channels == 3)
-      return std::make_unique<A2FastModel<3>>(std::move(weights), sampleRate);
-    if (channels == 8)
-      return std::make_unique<A2FastModel<8>>(std::move(weights), sampleRate);
-    throw std::runtime_error("A2FastConfig: unsupported channel count " + std::to_string(channels));
+      out = std::make_unique<A2FastModel<3>>(std::move(weights), sampleRate);
+    else if (channels == 8)
+      out = std::make_unique<A2FastModel<8>>(std::move(weights), sampleRate);
+    else
+      NAM_FAIL_RET(nam::Status::ErrorUnsupportedShape, "A2FastConfig: unsupported channel count", nullptr);
+
+    // The constructor loads weights and cannot report a bad stream by returning,
+    // so it latches instead. Check here, where there is somewhere to put the
+    // answer, and discard a model built from a stream that did not add up --
+    // otherwise it would run with zero-filled tail weights and sound wrong
+    // rather than fail. With exceptions enabled the constructor threw and this
+    // is never reached.
+    if (!IsOk(GetLastError()))
+      return nullptr;
+
+    return out;
   }
 };
 
@@ -1106,7 +1127,7 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config,
   (void)sampleRate;
   int ch = 0;
   if (!is_a2_shape(config, &ch))
-    throw std::runtime_error("create_a2_fast_config: config does not match A2 shape");
+    NAM_FAIL_RET(nam::Status::ErrorUnsupportedShape, "create_a2_fast_config: config does not match A2 shape", nullptr);
   return create_a2_fast_config(ch);
 }
 
@@ -1114,8 +1135,7 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(int channels)
 {
   if (channels != 3 && channels != 8)
   {
-    throw std::runtime_error("create_a2_fast_config: unsupported channel count "
-                             + std::to_string(channels));
+    NAM_FAIL_RET(nam::Status::ErrorUnsupportedShape, "create_a2_fast_config: unsupported channel count", nullptr);
   }
   auto out = std::make_unique<A2FastConfig>();
   out->channels = channels;

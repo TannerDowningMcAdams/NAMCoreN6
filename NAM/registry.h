@@ -12,6 +12,7 @@
 #include <functional>
 
 #include "dsp.h"
+#if !defined(NAM_NO_JSON)
 
 namespace nam
 {
@@ -67,3 +68,5 @@ struct Helper
 };
 } // namespace factory
 } // namespace nam
+
+#endif // !NAM_NO_JSON

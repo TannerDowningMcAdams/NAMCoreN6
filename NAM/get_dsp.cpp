@@ -1,6 +1,5 @@
 #include <iostream>
 #include <mutex>
-#include <regex>
 #include <sstream>
 #include <stdexcept>
 
@@ -15,13 +14,54 @@ namespace nam
 namespace
 {
 
+// Equivalent of the regex ^\d+\.\d+\.\d+$ : exactly three non-empty runs of
+// ASCII digits, separated by single dots, with nothing else in the string. No
+// sign, no whitespace, no fourth component, no trailing dot. Leading zeros are
+// accepted, as they were by the regex.
+//
+// Hand-rolled rather than std::regex because this was the library's only regex,
+// and <regex> is one of the most code-hungry headers in the standard library --
+// on a bare-metal target it costs more flash than the model it is guarding. The
+// check runs once per model load, so there is nothing to gain from a compiled
+// pattern either.
+bool is_semver_triple(const std::string& s)
+{
+  size_t i = 0;
+  int components = 0;
+
+  while (true)
+  {
+    const size_t start = i;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+    {
+      i++;
+    }
+    if (i == start) // empty component
+    {
+      return false;
+    }
+    components++;
+
+    if (i == s.size()) // end of string, on a component boundary
+    {
+      break;
+    }
+    if (s[i] != '.') // anything that is not a separator
+    {
+      return false;
+    }
+    i++; // consume the dot; the loop then requires another component
+  }
+
+  return components == 3;
+}
+
 class CoreVersionSupportChecker : public IVersionSupportChecker
 {
 public:
   Supported support(const std::string& version) const override
   {
-    static const std::regex semver_regex(R"(^\d+\.\d+\.\d+$)");
-    if (!std::regex_match(version, semver_regex))
+    if (!is_semver_triple(version))
       return Supported::NO;
 
     const Version parsed = ParseVersion(version);
@@ -203,28 +243,6 @@ std::unique_ptr<ModelConfig> parse_model_config_json(const std::string& architec
   return ConfigParserRegistry::instance().parse(architecture, config, sample_rate);
 }
 
-namespace
-{
-
-void apply_metadata(DSP& dsp, const ModelMetadata& metadata)
-{
-  if (metadata.loudness.has_value())
-    dsp.SetLoudness(metadata.loudness.value());
-  if (metadata.input_level.has_value())
-    dsp.SetInputLevel(metadata.input_level.value());
-  if (metadata.output_level.has_value())
-    dsp.SetOutputLevel(metadata.output_level.value());
-}
-
-} // anonymous namespace
-
-std::unique_ptr<DSP> create_dsp(std::unique_ptr<ModelConfig> config, std::vector<float> weights,
-                                const ModelMetadata& metadata)
-{
-  auto out = config->create(std::move(weights), metadata.sample_rate);
-  apply_metadata(*out, metadata);
-  return out;
-}
 
 // =============================================================================
 // get_dsp(dspData&) — now uses unified path

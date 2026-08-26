@@ -8,13 +8,30 @@
 
 #include "get_dsp_namb.h"
 
+// NAMB_WAVENET_ONLY trims this loader to the WaveNet architecture.
+//
+// Each architecture is pulled into the link by its registration below, not by
+// anything referencing it: registering Linear, LSTM and ConvNet is what drags
+// linear.cpp, lstm.cpp and convnet.cpp in. A target that only ever loads
+// WaveNet models -- an A2 pedal, say -- pays for three architectures it can
+// never be handed. Defining this drops them, and a .namb carrying one of those
+// architecture IDs then fails cleanly in the registry ("unknown architecture
+// ID") rather than silently mis-loading.
+//
+// Undefined by default, so desktop and test builds keep every architecture.
+
 #include <NAM/activations.h>
-#include <NAM/convnet.h>
 #include <NAM/dsp.h>
-#include <NAM/lstm.h>
 #include <NAM/model_config.h>
+#include <NAM/get_dsp.h>
+#include <NAM/status.h>
 #include <NAM/wavenet/model.h>
 #include <NAM/wavenet/params.h>
+#if !defined(NAMB_WAVENET_ONLY)
+  #include <NAM/convnet.h>
+  #include <NAM/linear.h>
+  #include <NAM/lstm.h>
+#endif
 #if defined(NAM_ENABLE_A2_FAST)
   #include <NAM/wavenet/a2_fast.h>
 #endif
@@ -136,6 +153,45 @@ ParsedMetadata read_metadata_block(BinaryReader& r)
   return m;
 }
 
+// Model config version check, done on the integers the header already carries.
+//
+// nam::verify_config_version() takes a string, and getting one means composing
+// major/minor/patch with std::to_string only for it to be parsed straight back.
+// That round trip also drags in the whole support-checker path -- a registry
+// behind a std::mutex, shared_ptr, stringstream -- for what is a comparison of
+// three small integers. On a target built without exceptions and counting
+// flash, none of that is worth having.
+//
+// Bounds come from get_dsp.h so the two checks cannot describe different ranges.
+bool is_model_version_supported(int major, int minor, int patch)
+{
+  // Below the earliest supported version?
+  if (major != nam::EARLIEST_SUPPORTED_NAM_FILE_VERSION_MAJOR)
+  {
+    if (major < nam::EARLIEST_SUPPORTED_NAM_FILE_VERSION_MAJOR)
+      return false;
+  }
+  else if (minor != nam::EARLIEST_SUPPORTED_NAM_FILE_VERSION_MINOR)
+  {
+    if (minor < nam::EARLIEST_SUPPORTED_NAM_FILE_VERSION_MINOR)
+      return false;
+  }
+  else if (patch < nam::EARLIEST_SUPPORTED_NAM_FILE_VERSION_PATCH)
+  {
+    return false;
+  }
+
+  // Above the latest fully supported major/minor? The core checker treats a
+  // newer patch as PARTIAL rather than unsupported, so only major and minor
+  // gate acceptance here -- matching CoreVersionSupportChecker::support().
+  if (major > nam::LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION_MAJOR)
+    return false;
+  if (minor > nam::LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION_MINOR)
+    return false;
+
+  return true;
+}
+
 nam::ModelMetadata to_model_metadata(const ParsedMetadata& pm)
 {
   nam::ModelMetadata meta;
@@ -157,12 +213,14 @@ nam::ModelMetadata to_model_metadata(const ParsedMetadata& pm)
 
 // Forward declaration
 std::unique_ptr<nam::ModelConfig> load_model(BinaryReader& r, const float*& weights, size_t& weight_count,
-                                             const nam::ModelMetadata& meta, uint16_t format_version);
+                                             const nam::ModelMetadata& meta, uint16_t format_version, nam::Status& status);
+
+#if !defined(NAMB_WAVENET_ONLY)
 
 // --- Linear ---
 
 std::unique_ptr<nam::ModelConfig> load_linear(BinaryReader& r, const float*& /*weights*/, size_t& /*weight_count*/,
-                                              const nam::ModelMetadata&, uint16_t /*format_version*/)
+                                              const nam::ModelMetadata&, uint16_t /*format_version*/, nam::Status&)
 {
   auto cfg = std::make_unique<nam::linear::LinearConfig>();
   cfg->receptive_field = r.read_i32();
@@ -176,7 +234,7 @@ std::unique_ptr<nam::ModelConfig> load_linear(BinaryReader& r, const float*& /*w
 // --- LSTM ---
 
 std::unique_ptr<nam::ModelConfig> load_lstm(BinaryReader& r, const float*& /*weights*/, size_t& /*weight_count*/,
-                                            const nam::ModelMetadata&, uint16_t /*format_version*/)
+                                            const nam::ModelMetadata&, uint16_t /*format_version*/, nam::Status&)
 {
   auto cfg = std::make_unique<nam::lstm::LSTMConfig>();
   cfg->num_layers = r.read_u16();
@@ -191,7 +249,7 @@ std::unique_ptr<nam::ModelConfig> load_lstm(BinaryReader& r, const float*& /*wei
 // --- ConvNet ---
 
 std::unique_ptr<nam::ModelConfig> load_convnet(BinaryReader& r, const float*& /*weights*/, size_t& /*weight_count*/,
-                                               const nam::ModelMetadata&, uint16_t /*format_version*/)
+                                               const nam::ModelMetadata&, uint16_t /*format_version*/, nam::Status&)
 {
   auto cfg = std::make_unique<nam::convnet::ConvNetConfig>();
   cfg->channels = r.read_u16();
@@ -209,11 +267,13 @@ std::unique_ptr<nam::ModelConfig> load_convnet(BinaryReader& r, const float*& /*
 
   return cfg;
 }
+#endif // !NAMB_WAVENET_ONLY
+
 
 // --- WaveNet ---
 
 std::unique_ptr<nam::ModelConfig> load_wavenet(BinaryReader& r, const float*& weights, size_t& weight_count,
-                                               const nam::ModelMetadata& meta, uint16_t format_version)
+                                               const nam::ModelMetadata& meta, uint16_t format_version, nam::Status& status)
 {
   auto wc = std::make_unique<nam::wavenet::WaveNetConfig>();
   wc->in_channels = r.read_u8();
@@ -236,7 +296,9 @@ std::unique_ptr<nam::ModelConfig> load_wavenet(BinaryReader& r, const float*& we
     // Use local copies so load_model doesn't advance the outer pointers
     const float* cdsp_weights = weights;
     size_t cdsp_wc = cdsp_weight_count;
-    auto cdsp_config = load_model(r, cdsp_weights, cdsp_wc, cdsp_meta, format_version);
+    auto cdsp_config = load_model(r, cdsp_weights, cdsp_wc, cdsp_meta, format_version, status);
+    if (cdsp_config == nullptr)
+      return nullptr;
     std::vector<float> cdsp_weight_vec(weights, weights + cdsp_weight_count);
     wc->condition_dsp = nam::create_dsp(std::move(cdsp_config), std::move(cdsp_weight_vec), cdsp_meta);
 
@@ -381,9 +443,11 @@ std::unique_ptr<nam::ModelConfig> load_wavenet(BinaryReader& r, const float*& we
 // Static registration of binary parsers
 // =============================================================================
 
+#if !defined(NAMB_WAVENET_ONLY)
 static nam::namb::BinaryConfigParserHelper _register_linear(ARCH_LINEAR, load_linear);
 static nam::namb::BinaryConfigParserHelper _register_lstm(ARCH_LSTM, load_lstm);
 static nam::namb::BinaryConfigParserHelper _register_convnet(ARCH_CONVNET, load_convnet);
+#endif
 static nam::namb::BinaryConfigParserHelper _register_wavenet(ARCH_WAVENET, load_wavenet);
 
 // =============================================================================
@@ -391,13 +455,13 @@ static nam::namb::BinaryConfigParserHelper _register_wavenet(ARCH_WAVENET, load_
 // =============================================================================
 
 std::unique_ptr<nam::ModelConfig> load_model(BinaryReader& r, const float*& weights, size_t& weight_count,
-                                             const nam::ModelMetadata& meta, uint16_t format_version)
+                                             const nam::ModelMetadata& meta, uint16_t format_version, nam::Status& status)
 {
   uint8_t arch = r.read_u8();
   r.read_u8(); // reserved
   r.read_u16(); // config_size
 
-  return BinaryConfigParserRegistry::instance().parse(arch, r, weights, weight_count, meta, format_version);
+  return BinaryConfigParserRegistry::instance().parse(arch, r, weights, weight_count, meta, format_version, status);
 }
 
 } // anonymous namespace
@@ -406,66 +470,129 @@ std::unique_ptr<nam::ModelConfig> load_model(BinaryReader& r, const float*& weig
 // Public API
 // =============================================================================
 
-std::unique_ptr<nam::DSP> nam::get_dsp_namb(const uint8_t* data, size_t size)
+std::unique_ptr<nam::DSP> nam::get_dsp_namb(const uint8_t* data, size_t size, nam::Status& status)
 {
-  if (size < FILE_HEADER_SIZE + METADATA_BLOCK_SIZE)
-    throw std::runtime_error("NAMB: file too small");
+  status = Status::Ok;
+
+  // Deep construction failures latch rather than return; clear before the load
+  // so anything found afterwards belongs to this model and not a previous one.
+  ClearLastError();
+
+  if (data == nullptr || size < FILE_HEADER_SIZE + METADATA_BLOCK_SIZE)
+  {
+    status = Status::ErrorTooSmall;
+    return nullptr;
+  }
 
   BinaryReader header_reader(data, FILE_HEADER_SIZE);
 
   // Validate magic
-  uint32_t magic = header_reader.read_u32();
+  const uint32_t magic = header_reader.read_u32();
   if (magic != MAGIC)
-    throw std::runtime_error("NAMB: invalid magic number");
+  {
+    status = Status::ErrorBadMagic;
+    return nullptr;
+  }
 
-  // Validate format version
-  uint16_t version = header_reader.read_u16();
+  // Validate container format version
+  const uint16_t version = header_reader.read_u16();
   if (version < MIN_FORMAT_VERSION || version > FORMAT_VERSION)
-    throw std::runtime_error("NAMB: unsupported format version " + std::to_string(version) + " (supported: "
-                             + std::to_string(MIN_FORMAT_VERSION) + ".." + std::to_string(FORMAT_VERSION) + ")");
+  {
+    status = Status::ErrorUnsupportedVersion;
+    return nullptr;
+  }
 
   header_reader.read_u16(); // flags
-  uint32_t total_file_size = header_reader.read_u32();
-  uint32_t weights_offset = header_reader.read_u32();
-  uint32_t total_weight_count = header_reader.read_u32();
+  const uint32_t total_file_size = header_reader.read_u32();
+  const uint32_t weights_offset = header_reader.read_u32();
+  const uint32_t total_weight_count = header_reader.read_u32();
   header_reader.read_u32(); // model_block_size
-  uint32_t stored_checksum = header_reader.read_u32();
+  const uint32_t stored_checksum = header_reader.read_u32();
+
+  if (header_reader.failed())
+  {
+    status = Status::ErrorTruncated;
+    return nullptr;
+  }
 
   // Validate file size
   if (size < total_file_size)
-    throw std::runtime_error("NAMB: file truncated (expected " + std::to_string(total_file_size) + " bytes, got "
-                             + std::to_string(size) + ")");
+  {
+    status = Status::ErrorTruncated;
+    return nullptr;
+  }
 
   // Validate CRC32
-  uint32_t computed_checksum = compute_file_crc32(data, total_file_size);
-  if (computed_checksum != stored_checksum)
-    throw std::runtime_error("NAMB: checksum mismatch");
+  if (compute_file_crc32(data, total_file_size) != stored_checksum)
+  {
+    status = Status::ErrorChecksum;
+    return nullptr;
+  }
 
-  // Validate weights section
-  size_t expected_weights_end = weights_offset + total_weight_count * sizeof(float);
-  if (expected_weights_end > total_file_size)
-    throw std::runtime_error("NAMB: weights extend beyond file");
+  // Validate weights section. Checked before it is used as a pointer, and
+  // ordered so weights_offset itself cannot be past the end either.
+  const size_t expected_weights_end = static_cast<size_t>(weights_offset) + total_weight_count * sizeof(float);
+  if (weights_offset < MODEL_BLOCK_OFFSET || expected_weights_end > total_file_size)
+  {
+    status = Status::ErrorWeightsOutOfRange;
+    return nullptr;
+  }
 
   // Read metadata block (at offset 32)
   BinaryReader meta_reader(data + FILE_HEADER_SIZE, METADATA_BLOCK_SIZE);
-  ParsedMetadata pm = read_metadata_block(meta_reader);
-  ModelMetadata meta = to_model_metadata(pm);
+  const ParsedMetadata pm = read_metadata_block(meta_reader);
+  const ModelMetadata meta = to_model_metadata(pm);
 
-  // Verify config version
-  nam::verify_config_version(meta.version);
+  // Verify model config version straight from the three integers the header
+  // carries. See is_model_version_supported() for why this does not go through
+  // nam::verify_config_version().
+  if (!is_model_version_supported(pm.version_major, pm.version_minor, pm.version_patch))
+  {
+    status = Status::ErrorUnsupportedModelVersion;
+    return nullptr;
+  }
 
   // Get weight data pointer
   const float* weights = reinterpret_cast<const float*>(data + weights_offset);
   size_t weight_count = total_weight_count;
 
   // Read model block (at offset 80)
-  size_t model_data_size = weights_offset - MODEL_BLOCK_OFFSET;
+  const size_t model_data_size = weights_offset - MODEL_BLOCK_OFFSET;
   BinaryReader model_reader(data + MODEL_BLOCK_OFFSET, model_data_size);
 
-  // Load model config, then construct via unified path
-  auto config = load_model(model_reader, weights, weight_count, meta, version);
+  // Load model config, then construct via the unified path
+  auto config = load_model(model_reader, weights, weight_count, meta, version, status);
+  if (config == nullptr)
+  {
+    if (IsOk(status))
+      status = Status::ErrorInvalidConfig;
+    return nullptr;
+  }
+  if (model_reader.failed())
+  {
+    status = Status::ErrorTruncated;
+    return nullptr;
+  }
+
   std::vector<float> weight_vec(weights, weights + weight_count);
-  auto dsp = create_dsp(std::move(config), std::move(weight_vec), meta);
+  auto dsp = create_dsp(std::move(config), std::move(weight_vec), meta, status);
+  if (dsp == nullptr && IsOk(status))
+    status = Status::Error;
+  return dsp;
+}
+
+#if !defined(NAM_NO_EXCEPTIONS)
+
+// Throwing wrappers. The Status overload above is the implementation; these
+// only translate a failed status into an exception, so the two can never
+// disagree about what counts as a failure.
+
+std::unique_ptr<nam::DSP> nam::get_dsp_namb(const uint8_t* data, size_t size)
+{
+  Status status = Status::Ok;
+  auto dsp = get_dsp_namb(data, size, status);
+  if (dsp == nullptr)
+    throw std::runtime_error(std::string("NAMB: ") + ToString(status));
   return dsp;
 }
 
@@ -488,3 +615,5 @@ std::unique_ptr<nam::DSP> nam::get_dsp_namb(const std::filesystem::path& filenam
 
   return get_dsp_namb(data.data(), data.size());
 }
+
+#endif // !NAM_NO_EXCEPTIONS

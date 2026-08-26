@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include "status.h"
 #include <unordered_map>
 #include <vector>
 
@@ -285,7 +286,7 @@ public:
 #ifndef NDEBUG
     if (size % negative_slopes.size() != 0)
     {
-      throw std::invalid_argument("PReLU.apply(*data, size) was given an array of size " + std::to_string(size)
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "PReLU.apply(*data, size) was given an array of size " + std::to_string(size)
                                   + " but the activation has " + std::to_string(negative_slopes.size())
                                   + " channels, which doesn't divide evenly.");
     }
@@ -306,7 +307,7 @@ public:
 #ifndef NDEBUG
     if (actual_channels != negative_slopes.size())
     {
-      throw std::invalid_argument("PReLU: Received " + std::to_string(actual_channels)
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "PReLU: Received " + std::to_string(actual_channels)
                                   + " channels, but activation has " + std::to_string(negative_slopes.size())
                                   + " channels");
     }

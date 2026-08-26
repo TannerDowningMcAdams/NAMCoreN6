@@ -1,4 +1,5 @@
 #include "activations.h"
+#include "status.h"
 
 // Global singleton instances (statically allocated, never deleted)
 static nam::activations::ActivationTanh _TANH;
@@ -82,7 +83,7 @@ nam::activations::ActivationConfig nam::activations::ActivationConfig::from_json
     auto it = type_map.find(name);
     if (it == type_map.end())
     {
-      throw std::runtime_error("Unknown activation type: " + name);
+      NAM_FAIL_RET(nam::Status::ErrorInvalidConfig, "Unknown activation type: " + name, config);
     }
     config.type = it->second;
     return config;
@@ -95,7 +96,7 @@ nam::activations::ActivationConfig nam::activations::ActivationConfig::from_json
     auto it = type_map.find(type_str);
     if (it == type_map.end())
     {
-      throw std::runtime_error("Unknown activation type: " + type_str);
+      NAM_FAIL_RET(nam::Status::ErrorInvalidConfig, "Unknown activation type: " + type_str, config);
     }
     config.type = it->second;
 
@@ -126,7 +127,7 @@ nam::activations::ActivationConfig nam::activations::ActivationConfig::from_json
     return config;
   }
 
-  throw std::runtime_error("Invalid activation config: expected string or object");
+  NAM_FAIL_RET(nam::Status::ErrorInvalidConfig, "Invalid activation config: expected string or object", config);
 }
 
 nam::activations::Activation::Ptr nam::activations::Activation::get_activation(const ActivationConfig& config)
@@ -206,7 +207,7 @@ void nam::activations::Activation::enable_lut(std::string function_name, float m
   }
   else
   {
-    throw std::runtime_error("Tried to enable LUT for a function other than Tanh, Sigmoid, or SiLU");
+    NAM_FAIL(nam::Status::ErrorInvalidConfig, "Tried to enable LUT for a function other than Tanh, Sigmoid, or SiLU");
   }
   _activations[function_name] = std::make_shared<FastLUTActivation>(min, max, n_points, fn);
 }
@@ -227,6 +228,6 @@ void nam::activations::Activation::disable_lut(std::string function_name)
   }
   else
   {
-    throw std::runtime_error("Tried to disable LUT for a function other than Tanh, Sigmoid, or SiLU");
+    NAM_FAIL(nam::Status::ErrorInvalidConfig, "Tried to disable LUT for a function other than Tanh, Sigmoid, or SiLU");
   }
 }

@@ -119,81 +119,109 @@ public:
   : _data(data)
   , _size(size)
   , _pos(0)
+  , _failed(false)
   {
   }
 
+  /// \brief True once any read has run past the end of the buffer.
+  ///
+  /// Overrun is sticky rather than thrown. A caller checks once after parsing
+  /// instead of guarding every field, and the same reader serves builds with
+  /// and without exceptions. Reads after a failure yield zero and do not
+  /// advance, so a truncated buffer produces a well-defined parse that is then
+  /// rejected wholesale -- it can never read adjacent memory.
+  bool failed() const { return _failed; }
+
   uint8_t read_u8()
   {
-    check(1);
+    if (!check(1))
+      return 0;
     return _data[_pos++];
   }
 
   uint16_t read_u16()
   {
-    check(2);
-    uint16_t v;
-    std::memcpy(&v, _data + _pos, 2);
-    _pos += 2;
+    uint16_t v = 0;
+    if (check(2))
+    {
+      std::memcpy(&v, _data + _pos, 2);
+      _pos += 2;
+    }
     return v;
   }
 
   uint32_t read_u32()
   {
-    check(4);
-    uint32_t v;
-    std::memcpy(&v, _data + _pos, 4);
-    _pos += 4;
+    uint32_t v = 0;
+    if (check(4))
+    {
+      std::memcpy(&v, _data + _pos, 4);
+      _pos += 4;
+    }
     return v;
   }
 
   int32_t read_i32()
   {
-    check(4);
-    int32_t v;
-    std::memcpy(&v, _data + _pos, 4);
-    _pos += 4;
+    int32_t v = 0;
+    if (check(4))
+    {
+      std::memcpy(&v, _data + _pos, 4);
+      _pos += 4;
+    }
     return v;
   }
 
   float read_f32()
   {
-    check(4);
-    float v;
-    std::memcpy(&v, _data + _pos, 4);
-    _pos += 4;
+    float v = 0.0f;
+    if (check(4))
+    {
+      std::memcpy(&v, _data + _pos, 4);
+      _pos += 4;
+    }
     return v;
   }
 
   double read_f64()
   {
-    check(8);
-    double v;
-    std::memcpy(&v, _data + _pos, 8);
-    _pos += 8;
+    double v = 0.0;
+    if (check(8))
+    {
+      std::memcpy(&v, _data + _pos, 8);
+      _pos += 8;
+    }
     return v;
   }
 
   void skip(size_t n)
   {
-    check(n);
-    _pos += n;
+    if (check(n))
+      _pos += n;
   }
 
   size_t position() const { return _pos; }
-  size_t remaining() const { return _size - _pos; }
+  size_t remaining() const { return _failed ? 0u : _size - _pos; }
 
   const uint8_t* current_ptr() const { return _data + _pos; }
 
 private:
-  void check(size_t n) const
+  bool check(size_t n)
   {
+    if (_failed)
+      return false;
     if (_pos + n > _size)
-      throw std::runtime_error("NAMB: unexpected end of data at offset " + std::to_string(_pos));
+    {
+      _failed = true;
+      return false;
+    }
+    return true;
   }
 
   const uint8_t* _data;
   size_t _size;
   size_t _pos;
+  bool _failed;
 };
 
 // =============================================================================

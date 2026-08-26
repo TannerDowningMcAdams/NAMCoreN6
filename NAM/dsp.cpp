@@ -9,6 +9,7 @@
 #include <unordered_set>
 
 #include "dsp.h"
+#include "status.h"
 #define tanh_impl_ std::tanh
 // #define tanh_impl_ fast_tanh_
 
@@ -60,7 +61,7 @@ nam::DSP::DSP(const int in_channels, const int out_channels, const double expect
 {
   if (in_channels <= 0 || out_channels <= 0)
   {
-    throw std::runtime_error("Channel counts must be positive");
+    NAM_FAIL(nam::Status::ErrorInvalidConfig, "Channel counts must be positive");
   }
 }
 
@@ -122,7 +123,8 @@ double nam::DSP::GetLoudness() const
 {
   if (!HasLoudness())
   {
-    throw std::runtime_error("Asked for loudness of a model that doesn't know how loud it is!");
+    NAM_FAIL_RET(nam::Status::ErrorInvalidConfig,
+                 "Asked for loudness of a model that doesn't know how loud it is!", 0.0);
   }
   return mLoudness;
 }
@@ -313,12 +315,12 @@ nam::Conv1x1::Conv1x1(const int in_channels, const int out_channels, const bool 
   // Validate that channels divide evenly by groups
   if (in_channels % groups != 0)
   {
-    throw std::runtime_error("in_channels (" + std::to_string(in_channels) + ") must be divisible by numGroups ("
+    NAM_FAIL(nam::Status::ErrorInvalidConfig, "in_channels (" + std::to_string(in_channels) + ") must be divisible by numGroups ("
                              + std::to_string(groups) + ")");
   }
   if (out_channels % groups != 0)
   {
-    throw std::runtime_error("out_channels (" + std::to_string(out_channels) + ") must be divisible by numGroups ("
+    NAM_FAIL(nam::Status::ErrorInvalidConfig, "out_channels (" + std::to_string(out_channels) + ") must be divisible by numGroups ("
                              + std::to_string(groups) + ")");
   }
 

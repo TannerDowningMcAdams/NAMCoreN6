@@ -66,6 +66,24 @@ void verify_config_version(const std::string versionStr);
 const std::string LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION = "0.7.0";
 const std::string EARLIEST_SUPPORTED_NAM_FILE_VERSION = "0.5.0";
 
+// Integer forms of the same two bounds.
+//
+// A binary loader already holds the version as three integers -- .namb stores
+// major/minor/patch as three uint8_t -- so composing them into a string just to
+// have verify_config_version() parse it back is wasted work. Worse, on an
+// embedded target it pulls in the whole string/registry/mutex path for a
+// three-number comparison.
+//
+// Kept adjacent to the strings above so the two cannot be updated separately.
+// nam::namb::is_model_version_supported() checks against these.
+constexpr int LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION_MAJOR = 0;
+constexpr int LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION_MINOR = 7;
+constexpr int LATEST_FULLY_SUPPORTED_NAM_FILE_VERSION_PATCH = 0;
+
+constexpr int EARLIEST_SUPPORTED_NAM_FILE_VERSION_MAJOR = 0;
+constexpr int EARLIEST_SUPPORTED_NAM_FILE_VERSION_MINOR = 5;
+constexpr int EARLIEST_SUPPORTED_NAM_FILE_VERSION_PATCH = 0;
+
 /// \brief Options that control DSP loading behavior
 struct DspLoadOptions
 {

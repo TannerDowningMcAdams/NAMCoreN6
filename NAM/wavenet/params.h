@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "../activations.h"
+#include "../status.h"
 
 namespace nam
 {
@@ -245,32 +246,32 @@ public:
   {
     if (head_kernel_size < 1)
     {
-      throw std::invalid_argument("LayerArrayParams: head_kernel_size must be >= 1");
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "LayerArrayParams: head_kernel_size must be >= 1");
     }
     const size_t num_layers = dilations.size();
     if (kernel_sizes.empty())
     {
-      throw std::invalid_argument("LayerArrayParams: kernel_sizes must not be empty");
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "LayerArrayParams: kernel_sizes must not be empty");
     }
     if (kernel_sizes.size() != num_layers)
     {
-      throw std::invalid_argument("LayerArrayParams: dilations size (" + std::to_string(num_layers)
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "LayerArrayParams: dilations size (" + std::to_string(num_layers)
                                   + ") must match kernel_sizes size (" + std::to_string(kernel_sizes.size()) + ")");
     }
     if (activation_configs.size() != num_layers)
     {
-      throw std::invalid_argument("LayerArrayParams: dilations size (" + std::to_string(num_layers)
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "LayerArrayParams: dilations size (" + std::to_string(num_layers)
                                   + ") must match activation_configs size (" + std::to_string(activation_configs.size())
                                   + ")");
     }
     if (gating_modes.size() != num_layers)
     {
-      throw std::invalid_argument("LayerArrayParams: dilations size (" + std::to_string(num_layers)
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "LayerArrayParams: dilations size (" + std::to_string(num_layers)
                                   + ") must match gating_modes size (" + std::to_string(gating_modes.size()) + ")");
     }
     if (secondary_activation_configs.size() != num_layers)
     {
-      throw std::invalid_argument("LayerArrayParams: dilations size (" + std::to_string(num_layers)
+      NAM_FAIL(nam::Status::ErrorInvalidConfig, "LayerArrayParams: dilations size (" + std::to_string(num_layers)
                                   + ") must match secondary_activation_configs size ("
                                   + std::to_string(secondary_activation_configs.size()) + ")");
     }
