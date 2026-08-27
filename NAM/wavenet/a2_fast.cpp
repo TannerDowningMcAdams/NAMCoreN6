@@ -8,6 +8,59 @@
     #define NAM_A2_RING_MODE 1
   #endif
 
+  // Compile-time model block size, in frames. 0 = dynamic (upstream behaviour:
+  // the block size is whatever Reset()/SetMaxBufferSize() was given).
+  //
+  // Setting it turns num_frames and GetMaxBufferSize() into compile-time
+  // constants through the whole hot path, which buys two things on Cortex-M
+  // that matter more the smaller the block is:
+  //
+  //   - the std::memcpy sizes in the ring writes become constants, so GCC
+  //     expands them inline instead of calling newlib's memcpy. At a 8-frame
+  //     block that is 48 out-of-line calls per block, each moving <= 96 bytes,
+  //     and newlib's generic memcpy is poor on this core.
+  //
+  //   - the per-frame loops become constant-trip, so GCC can fully unroll them
+  //     and keep the z accumulator in registers across taps instead of
+  //     reloading and restoring it from _z on every tap.
+  //
+  // A model whose block size does not match is refused in process() rather
+  // than run: every bound below would be wrong.
+  #ifndef NAM_A2_FIXED_BLOCK
+    #define NAM_A2_FIXED_BLOCK 0
+  #endif
+
+  // Optional external profiling probes, off by default.
+  //
+  // This library must not depend on firmware headers, so the probe is a pair of
+  // extern "C" symbols the host image supplies. Enable with -DNAM_A2_PROFILE=1
+  // and define both; leave it off and the calls vanish entirely.
+  //
+  // Probe ids are deliberately coarse. Per-layer probing costs 23x as much and
+  // says nothing the aggregate does not: the accumulators on the host side sum
+  // across calls, so bracketing every layer already yields the total share.
+  #ifndef NAM_A2_PROFILE
+    #define NAM_A2_PROFILE 0
+  #endif
+
+  #if NAM_A2_PROFILE
+/// Probe ids passed to the host's nam_a2_profile_* hooks.
+enum
+{
+  /// The K-specialized per-layer kernel only -- conv, mixin, activation,
+  /// head-sum accumulate and the 1x1 residual. Excludes the ring write, so
+  /// (model total - this) isolates the ring/copy overhead.
+  kNamA2ProbeLayerMath = 0
+};
+extern "C" void nam_a2_profile_enter(int id);
+extern "C" void nam_a2_profile_exit(int id);
+    #define NAM_A2_PROF_ENTER(id) ::nam_a2_profile_enter(id)
+    #define NAM_A2_PROF_EXIT(id) ::nam_a2_profile_exit(id)
+  #else
+    #define NAM_A2_PROF_ENTER(id) ((void)0)
+    #define NAM_A2_PROF_EXIT(id) ((void)0)
+  #endif
+
   #include "a2_fast.h"
 
   #include <algorithm>
@@ -64,6 +117,10 @@ public:
   static constexpr int kChannels = Channels;
   static constexpr int kBottleneck = Channels;
   static constexpr int kHeadIn = Channels;
+  #if NAM_A2_FIXED_BLOCK > 0
+  /// Block size this translation unit is specialized for. See NAM_A2_FIXED_BLOCK.
+  static constexpr int kFixedBlock = NAM_A2_FIXED_BLOCK;
+  #endif
 
   A2FastModel(std::vector<float> weights, double expected_sample_rate);
   ~A2FastModel() override = default;
@@ -310,11 +367,53 @@ int next_pow2(int v)
     p <<= 1;
   return p;
 }
+
+// Fixed-length non-overlapping float copy.
+//
+// Not std::memcpy: even with a compile-time constant length, GCC declines to
+// expand a 96-byte copy inline on this target and emits a call to newlib's
+// memcpy, which is poor on Cortex-M -- and at an 8-frame block the ring writes
+// would make ~48 such calls per block, all of them 96 bytes. Written as a
+// constant-trip loop over floats it is fully unrolled into load/store pairs
+// with no call, no alignment dispatch, and no size test.
+//
+// Callers must guarantee the ranges do not overlap; both ring-write uses do.
+template <int N>
+inline void copy_floats(float* __restrict dst, const float* __restrict src)
+{
+  for (int i = 0; i < N; i++)
+    dst[i] = src[i];
+}
+
+/// One block's worth of columns: nf * Channels floats. Unrolled when the block
+/// size is compile-time, a plain memcpy otherwise. Ranges must not overlap.
+template <int Channels>
+inline void copy_block(float* dst, const float* src, int nf)
+{
+  #if NAM_A2_FIXED_BLOCK > 0
+  (void)nf; // == NAM_A2_FIXED_BLOCK, enforced in process()/SetMaxBufferSize()
+  copy_floats<NAM_A2_FIXED_BLOCK * Channels>(dst, src);
+  #else
+  std::memcpy(dst, src, static_cast<size_t>(nf) * Channels * sizeof(float));
+  #endif
+}
 } // namespace
 
 template <int Channels>
 void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 {
+  #if NAM_A2_FIXED_BLOCK > 0
+  // Caught here, at Reset() time, where A2FastConfig::create()'s caller can
+  // still see the latch and discard the model -- rather than at the first
+  // process() call, in the audio interrupt, with the buffers already sized
+  // wrong. Everything below allocates to kFixedBlock regardless.
+  if (maxBufferSize != kFixedBlock)
+  {
+    NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: maxBufferSize != NAM_A2_FIXED_BLOCK");
+    return;
+  }
+  #endif
+
   DSP::SetMaxBufferSize(maxBufferSize);
 
   _layer_in.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
@@ -428,23 +527,41 @@ void A2FastModel<Channels>::CacheStateAsPrewarmed()
 template <int Channels>
 void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
 {
-  #if NAM_A2_RING_MODE == 1
+  #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames; // checked against kFixedBlock in process()
+  #else
+  const int nf = num_frames;
+    #if NAM_A2_RING_MODE == 1
   const int mbs = GetMaxBufferSize();
+    #endif
+  #endif
+
+  #if NAM_A2_RING_MODE == 1
   float* const hist = L.history.data();
   const float* const src = _layer_in.data();
   const int wp = L.write_pos;
-  const int first = std::min(num_frames, L.pow2_size - wp);
-  std::memcpy(hist + static_cast<size_t>(wp) * Channels, src, static_cast<size_t>(first) * Channels * sizeof(float));
-  if (first < num_frames)
+  // Split rather than std::min: on the no-wrap path the copy length is nf,
+  // which is a compile-time constant under NAM_A2_FIXED_BLOCK, so GCC expands
+  // it inline. Folded into a min() the length is runtime-variable and every
+  // block pays an out-of-line newlib memcpy per layer. The wrap path keeps the
+  // variable-length calls but only fires once per (pow2_size / nf) blocks.
+  if (wp + nf <= L.pow2_size)
   {
-    std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
-                static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
+    copy_block<Channels>(hist + static_cast<size_t>(wp) * Channels, src, nf);
   }
-  std::memcpy(
-    hist + static_cast<size_t>(L.pow2_size) * Channels, hist, static_cast<size_t>(mbs) * Channels * sizeof(float));
-  L.write_pos = (wp + num_frames) & L.pow2_mask;
+  else
+  {
+    const int first = L.pow2_size - wp;
+    std::memcpy(hist + static_cast<size_t>(wp) * Channels, src, static_cast<size_t>(first) * Channels * sizeof(float));
+    std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
+                static_cast<size_t>(nf - first) * Channels * sizeof(float));
+  }
+  copy_block<Channels>(hist + static_cast<size_t>(L.pow2_size) * Channels, hist, mbs);
+  L.write_pos = (wp + nf) & L.pow2_mask;
   #else
-  if (L.write_pos + num_frames > L.history_cols)
+  if (L.write_pos + nf > L.history_cols)
   {
     const int keep = L.max_lookback;
     std::memmove(L.history.data(), L.history.data() + static_cast<size_t>(L.write_pos - keep) * Channels,
@@ -452,40 +569,54 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
     L.write_pos = keep;
   }
   std::memcpy(L.history.data() + static_cast<size_t>(L.write_pos) * Channels, _layer_in.data(),
-              static_cast<size_t>(num_frames) * Channels * sizeof(float));
-  L.write_pos += num_frames;
+              static_cast<size_t>(nf) * Channels * sizeof(float));
+  L.write_pos += nf;
   #endif
 }
 
 template <int Channels>
 void A2FastModel<Channels>::_head_ring_write(int num_frames)
 {
-  #if NAM_A2_RING_MODE == 1
+  #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames; // checked against kFixedBlock in process()
+  #else
+  const int nf = num_frames;
+    #if NAM_A2_RING_MODE == 1
   const int mbs = GetMaxBufferSize();
+    #endif
+  #endif
+
+  #if NAM_A2_RING_MODE == 1
   float* const hist = _head_history.data();
   const float* const src = _head_sum.data();
   const int wp = _head_write_pos;
-  const int first = std::min(num_frames, _head_pow2_size - wp);
-  std::memcpy(hist + static_cast<size_t>(wp) * Channels, src, static_cast<size_t>(first) * Channels * sizeof(float));
-  if (first < num_frames)
+  // Same no-wrap split as _ring_write, for the same reason.
+  if (wp + nf <= _head_pow2_size)
   {
-    std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
-                static_cast<size_t>(num_frames - first) * Channels * sizeof(float));
+    copy_block<Channels>(hist + static_cast<size_t>(wp) * Channels, src, nf);
   }
-  std::memcpy(
-    hist + static_cast<size_t>(_head_pow2_size) * Channels, hist, static_cast<size_t>(mbs) * Channels * sizeof(float));
-  _head_write_pos = (wp + num_frames) & _head_pow2_mask;
+  else
+  {
+    const int first = _head_pow2_size - wp;
+    std::memcpy(hist + static_cast<size_t>(wp) * Channels, src, static_cast<size_t>(first) * Channels * sizeof(float));
+    std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
+                static_cast<size_t>(nf - first) * Channels * sizeof(float));
+  }
+  copy_block<Channels>(hist + static_cast<size_t>(_head_pow2_size) * Channels, hist, mbs);
+  _head_write_pos = (wp + nf) & _head_pow2_mask;
   #else
   const int keep = kHeadKernelSize - 1;
-  if (_head_write_pos + num_frames > _head_history_cols)
+  if (_head_write_pos + nf > _head_history_cols)
   {
     std::memmove(_head_history.data(), _head_history.data() + static_cast<size_t>(_head_write_pos - keep) * Channels,
                  static_cast<size_t>(keep) * Channels * sizeof(float));
     _head_write_pos = keep;
   }
   std::memcpy(_head_history.data() + static_cast<size_t>(_head_write_pos) * Channels, _head_sum.data(),
-              static_cast<size_t>(num_frames) * Channels * sizeof(float));
-  _head_write_pos += num_frames;
+              static_cast<size_t>(nf) * Channels * sizeof(float));
+  _head_write_pos += nf;
   #endif
 }
 
@@ -504,15 +635,21 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 {
   constexpr int K = KernelSize;
   const int D = L.dilation;
+  #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  (void)num_frames; // checked against kFixedBlock in process()
+  #else
+  const int nf = num_frames;
+  #endif
   // Physical ring position of this block's first frame, offset by `taps_back *
   // D` samples into the past. In pow2 mode the position is wrapped by mask and
   // reads spanning the wrap land in the tail mirror; in linear mode write_pos
   // is monotonic and arithmetic is plain.
   #if NAM_A2_RING_MODE == 1
   const int mask = L.pow2_mask;
-  auto tap_base_phys = [&](int taps_back) { return (L.write_pos - num_frames - taps_back * D) & mask; };
+  auto tap_base_phys = [&](int taps_back) { return (L.write_pos - nf - taps_back * D) & mask; };
   #else
-  const int base = L.write_pos - num_frames;
+  const int base = L.write_pos - nf;
   auto tap_base_phys = [&](int taps_back) { return base - taps_back * D; };
   #endif
 
@@ -520,7 +657,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   //
   //   - Channels <= 4 (A2-Lite): full-block tap-major. The z accumulator lives
   //     in the heap buffer across all taps, and for each tap the inner f-loop
-  //     iterates over all num_frames. This gives clang frame-level
+  //     iterates over all nf. This gives clang frame-level
   //     parallelism — it vectorizes across 4 frames at a time, which matters
   //     more than weight-reload cost when the b-loop (3 wide) can't saturate
   //     NEON lanes on its own.
@@ -549,7 +686,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       const float w3 = wk[3], w4 = wk[4], w5 = wk[5];
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
       const float cb0 = L.conv_b[0], cb1 = L.conv_b[1], cb2 = L.conv_b[2];
-      for (int f = 0; f < num_frames; f++)
+      for (int f = 0; f < nf; f++)
       {
         const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
         float a0 = cb0 + w0 * src[0];
@@ -576,7 +713,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       const float w0 = wk[0], w1 = wk[1], w2 = wk[2];
       const float w3 = wk[3], w4 = wk[4], w5 = wk[5];
       const float w6 = wk[6], w7 = wk[7], w8 = wk[8];
-      for (int f = 0; f < num_frames; f++)
+      for (int f = 0; f < nf; f++)
       {
         const float* src = &L.history[static_cast<size_t>(tap_base + f) * 3];
         float* zf = z + static_cast<size_t>(f) * 3;
@@ -609,7 +746,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     const float lw10 = L.l1x1_w[3], lw11 = L.l1x1_w[4], lw12 = L.l1x1_w[5];
     const float lw20 = L.l1x1_w[6], lw21 = L.l1x1_w[7], lw22 = L.l1x1_w[8];
     const float lb0 = L.l1x1_b[0], lb1 = L.l1x1_b[1], lb2 = L.l1x1_b[2];
-    for (int f = 0; f < num_frames; f++)
+    for (int f = 0; f < nf; f++)
     {
       const float* src = &L.history[static_cast<size_t>(tap_base_last + f) * 3];
       const float* zf_mem = z + static_cast<size_t>(f) * 3;
@@ -628,6 +765,13 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       a0 += mw0 * cf;
       a1 += mw1 * cf;
       a2 += mw2 * cf;
+      // The ternary below compiles to VCMPE.F32 -> VMRS APSR_nzcv, fpscr -> IT/VMULMI, and
+      // that VMRS drains the FP pipeline (552 of them per block here). A
+      // branchless max(a,0) + slope*min(a,0) form removes them entirely --
+      // measured, it lowered to VMAXNM/VMINNM with no flag traffic as intended,
+      // and made the block *slightly slower*. The loop is not issue-limited on
+      // this path, so there is nothing to win here; keep the plain form, which
+      // also preserves the sign of zero exactly as the reference does.
       a0 = (a0 >= 0.0f) ? a0 : a0 * kLeakySlope;
       a1 = (a1 >= 0.0f) ? a1 : a1 * kLeakySlope;
       a2 = (a2 >= 0.0f) ? a2 : a2 * kLeakySlope;
@@ -667,11 +811,11 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<const VecC> mixin_vec(L.mixin_w.data());
     Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w.data());
     Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b.data());
-    Eigen::Map<const RowDyn> cond_row(cond, 1, num_frames);
+    Eigen::Map<const RowDyn> cond_row(cond, 1, nf);
 
-    Eigen::Map<MatCDyn> ztile(_z.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, num_frames);
-    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, num_frames);
+    Eigen::Map<MatCDyn> ztile(_z.data(), Channels, nf);
+    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, nf);
+    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, nf);
 
     ztile.setZero();
 
@@ -680,7 +824,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     {
       const int tap_base = tap_base_phys(K - 1 - k);
       Eigen::Map<const MatCC> W(&L.conv_w[static_cast<size_t>(k) * Channels * Channels]);
-      Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, num_frames);
+      Eigen::Map<const MatCDyn> input_block(&L.history[static_cast<size_t>(tap_base) * Channels], Channels, nf);
       ztile.noalias() += W * input_block;
     }
 
@@ -702,6 +846,7 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
 {
   Layer& L = _layers[layer_idx];
   _ring_write(L, num_frames);
+  NAM_A2_PROF_ENTER(kNamA2ProbeLayerMath);
   switch (L.kernel_size)
   {
     case 6: _layer_forward_k<6>(L, cond, num_frames); break;
@@ -710,6 +855,7 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
     // throw so the audio path stays exception-free; the block is left silent.
     default: NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: unexpected kernel_size"); break;
   }
+  NAM_A2_PROF_EXIT(kNamA2ProbeLayerMath);
 }
 
 // -----------------------------------------------------------------------------
@@ -719,15 +865,21 @@ template <int Channels>
 void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
 {
   _head_ring_write(num_frames);
+  #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  (void)num_frames; // checked against kFixedBlock in process()
+  #else
+  const int nf = num_frames;
+  #endif
   #if NAM_A2_RING_MODE == 1
   const int mask = _head_pow2_mask;
-  auto col_of = [&](int f, int k) { return (_head_write_pos - num_frames + f - (kHeadKernelSize - 1 - k)) & mask; };
+  auto col_of = [&](int f, int k) { return (_head_write_pos - nf + f - (kHeadKernelSize - 1 - k)) & mask; };
   #else
-  const int base = _head_write_pos - num_frames;
+  const int base = _head_write_pos - nf;
   auto col_of = [&](int f, int k) { return base + f - (kHeadKernelSize - 1 - k); };
   #endif
 
-  for (int f = 0; f < num_frames; f++)
+  for (int f = 0; f < nf; f++)
   {
     float y = _head_b;
     for (int k = 0; k < kHeadKernelSize; k++)
@@ -748,8 +900,23 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
 template <int Channels>
 void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames)
 {
+  #if NAM_A2_FIXED_BLOCK > 0
+  // Every bound in the hot path below is compiled for exactly kFixedBlock
+  // frames, so a caller asking for a different count would read and write past
+  // them. Refuse the block instead: latch, and leave the output untouched.
+  // SetMaxBufferSize() rejects a mismatched size at Reset() time, so reaching
+  // here means the caller changed its block size mid-stream.
+  if (num_frames != kFixedBlock)
+  {
+    NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: num_frames != NAM_A2_FIXED_BLOCK");
+    return;
+  }
+  constexpr int nf = kFixedBlock;
+  #else
   if (num_frames > GetMaxBufferSize())
     SetMaxBufferSize(num_frames);
+  const int nf = num_frames;
+  #endif
 
   const NAM_SAMPLE* in0 = input[0];
   NAM_SAMPLE* out0 = output[0];
@@ -757,7 +924,7 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   // Rechannel: layer_in[c, f] = _rechannel_w[c] * input[f] for c in Channels.
   // Also prepare float cond buffer (input copied to float for inner loops).
   float* cond = _cond.data();
-  for (int f = 0; f < num_frames; f++)
+  for (int f = 0; f < nf; f++)
   {
     const float x = static_cast<float>(in0[f]);
     cond[f] = x;
@@ -767,15 +934,15 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   }
 
   // Zero head accumulator.
-  std::memset(_head_sum.data(), 0, static_cast<size_t>(num_frames) * Channels * sizeof(float));
+  std::memset(_head_sum.data(), 0, static_cast<size_t>(nf) * Channels * sizeof(float));
 
   for (int li = 0; li < kNumLayers; li++)
-    _layer_forward(li, cond, num_frames);
+    _layer_forward(li, cond, nf);
 
   // Output.
   float* head_out = _head_out.data();
-  _head_forward(head_out, num_frames);
-  for (int f = 0; f < num_frames; f++)
+  _head_forward(head_out, nf);
+  for (int f = 0; f < nf; f++)
     out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
 }
 
