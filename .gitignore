@@ -32,8 +32,12 @@
 *.app
 
 .vscode/
+namb/work/
 
 docs/_build/
 *.DS_Store
 
 example_audio/output.wav
+
+# namb host-tool build tree (nambpack / nam2namb / split_slimmable)
+namb/build/

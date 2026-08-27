@@ -32,6 +32,21 @@ static uint8_t architecture_id(const std::string& name)
     return ARCH_LSTM;
   if (name == "WaveNet")
     return ARCH_WAVENET;
+
+  // Containers are the common case, not an exotic one: every A2 model ships as
+  // a SlimmableContainer wrapping A2-Lite (channels=3) and A2-Full (channels=8).
+  // The .namb format has no container architecture ID, so say what to do rather
+  // than just naming the architecture we did not recognise.
+  if (name == "SlimmableContainer" || name == "Sequential")
+  {
+    throw std::runtime_error(
+      "'" + name
+      + "' is a container architecture, which .namb cannot represent.\n"
+        "       Split it into standalone submodels first:\n"
+        "         split_slimmable <container.nam> <out_dir>\n"
+        "       then run nam2namb on the resulting <name>_sub<i>_ch<C>.nam files.");
+  }
+
   throw std::runtime_error("Unknown architecture: " + name);
 }
 
