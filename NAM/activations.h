@@ -2,7 +2,9 @@
 
 #include <cassert>
 #include <cmath> // expf
-#include <iostream> // std::cerr (kept for potential debug use)
+// <iostream> deliberately not included: its static ios_base::Init pulls in the
+// libstdc++ locale machinery, which on newlib-nano ends at an undefined
+// swprintf. Nothing in this header uses a stream.
 #include <stdexcept> // std::invalid_argument
 #include <functional>
 #include <memory>

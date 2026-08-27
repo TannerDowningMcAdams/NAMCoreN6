@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <cstring>
-#include <iostream>
+#if !defined(NAM_NO_EXCEPTIONS)
+  #include <iostream>
+  #include <sstream>
+#endif
 #include <math.h>
-#include <sstream>
 #include <stdexcept>
 
 #include <Eigen/Dense>
@@ -607,7 +609,7 @@ nam::wavenet::WaveNet::WaveNet(const int in_channels,
   {
     if (this->_get_condition_dim() != this->_condition_dsp->NumInputChannels())
     {
-      std::stringstream ss;
+      NAM_DIAG_STREAM ss;
       ss << "input channels of WaveNet (" << in_channels << ") don't match input channels of condition DSP ("
          << this->_condition_dsp->NumInputChannels() << "!\n";
       NAM_FAIL(nam::Status::ErrorInvalidConfig, ss.str().c_str());
@@ -619,7 +621,7 @@ nam::wavenet::WaveNet::WaveNet(const int in_channels,
       NAM_FAIL(nam::Status::ErrorInvalidConfig, "WaveNet: with_head is true but head configuration is missing");
     if (head_params->in_channels != layer_array_params.back().head_size)
     {
-      std::stringstream ss;
+      NAM_DIAG_STREAM ss;
       ss << "WaveNet head in_channels (" << head_params->in_channels << ") must match last layer array head_size ("
          << layer_array_params.back().head_size << ")";
       NAM_FAIL(nam::Status::ErrorInvalidConfig, ss.str());
@@ -636,7 +638,7 @@ nam::wavenet::WaveNet::WaveNet(const int in_channels,
     {
       if (layer_array_params[i].condition_size != this->_condition_dsp->NumOutputChannels())
       {
-        std::stringstream ss;
+        NAM_DIAG_STREAM ss;
         ss << "condition_size of layer " << i << " (" << layer_array_params[i].condition_size
            << ") doesn't match output channels of condition DSP (" << this->_condition_dsp->NumOutputChannels()
            << "!\n";
@@ -647,7 +649,7 @@ nam::wavenet::WaveNet::WaveNet(const int in_channels,
     if (i > 0)
       if (layer_array_params[i].channels != layer_array_params[i - 1].head_size)
       {
-        std::stringstream ss;
+        NAM_DIAG_STREAM ss;
         ss << "channels of layer " << i << " (" << layer_array_params[i].channels
            << ") doesn't match head_size of preceding layer (" << layer_array_params[i - 1].head_size << "!\n";
         NAM_FAIL(nam::Status::ErrorInvalidConfig, ss.str().c_str());
@@ -675,7 +677,7 @@ void nam::wavenet::WaveNet::set_weights_(std::vector<float>& weights)
   this->_head_scale = *(it++); // TODO `LayerArray.absorb_head_scale()`
   if (it != weights.end())
   {
-    std::stringstream ss;
+    NAM_DIAG_STREAM ss;
     for (size_t i = 0; i < weights.size(); i++)
       if (weights[i] == *it)
       {
@@ -927,7 +929,7 @@ nam::wavenet::WaveNetConfig nam::wavenet::parse_config_json(const nlohmann::json
     wc.condition_dsp = nam::get_dsp(condition_dsp_json);
     if (wc.condition_dsp->GetExpectedSampleRate() != expectedSampleRate)
     {
-      std::stringstream ss;
+      NAM_DIAG_STREAM ss;
       ss << "Condition DSP expected sample rate (" << wc.condition_dsp->GetExpectedSampleRate()
          << ") doesn't match WaveNet expected sample rate (" << expectedSampleRate << "!\n";
       NAM_FAIL(nam::Status::ErrorInvalidConfig, ss.str().c_str());
@@ -1075,7 +1077,8 @@ nam::wavenet::WaveNetConfig nam::wavenet::parse_config_json(const nlohmann::json
       else if (gating_mode_str == "none")
         return GatingMode::NONE;
       else
-        NAM_FAIL(nam::Status::ErrorInvalidConfig, "Invalid gating_mode: " + gating_mode_str);
+        NAM_FAIL_RET(nam::Status::ErrorInvalidConfig, "Invalid gating_mode: " + gating_mode_str,
+                     GatingMode::NONE);
     };
 
     if (layer_config.find("gating_mode") != layer_config.end())
@@ -1259,7 +1262,7 @@ nam::wavenet::WaveNetConfig nam::wavenet::parse_config_json(const nlohmann::json
       const int legacy_in = hj["in_channels"].get<int>();
       if (legacy_in != implied_in)
       {
-        std::stringstream ss;
+        NAM_DIAG_STREAM ss;
         ss << "WaveNet config: head.in_channels (" << legacy_in << ") must equal last layer's head_size (" << implied_in
            << ")";
         NAM_FAIL(nam::Status::ErrorInvalidConfig, ss.str());

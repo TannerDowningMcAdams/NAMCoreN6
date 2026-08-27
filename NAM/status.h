@@ -101,6 +101,39 @@ void ClearLastError();
 
 #if defined(NAM_NO_EXCEPTIONS)
 
+  #include <string>
+
+namespace nam
+{
+namespace detail
+{
+/// \brief Sink that swallows everything streamed into it.
+///
+/// Diagnostic messages are built with std::stringstream and then discarded by
+/// NAM_FAIL in this build. Merely *constructing* one costs far more than the
+/// message is worth: std::stringstream drags in the libstdc++ locale
+/// machinery, which reaches std::__timepunct -> wcsftime -> swprintf, and
+/// newlib-nano does not define swprintf. The link fails on a message nobody
+/// reads.
+///
+/// NAM_DIAG_STREAM declares one of these instead, so the formatting code still
+/// compiles but generates nothing.
+struct NullStream
+{
+  template <typename T>
+  NullStream& operator<<(const T&)
+  {
+    return *this;
+  }
+  std::string str() const { return std::string(); }
+};
+} // namespace detail
+} // namespace nam
+
+  /// \brief Type to declare a diagnostic message stream with.
+  ///        `NAM_DIAG_STREAM ss; ss << ...; NAM_FAIL(status, ss.str());`
+  #define NAM_DIAG_STREAM ::nam::detail::NullStream
+
   #define NAM_FAIL(status, msg) ::nam::SetLastError(status)
 
   #define NAM_FAIL_RET(status, msg, ret)                                                                               \
@@ -114,6 +147,11 @@ void ClearLastError();
 
   #include <stdexcept>
   #include <string>
+  #include <sstream>
+
+  /// brief Type to declare a diagnostic message stream with. See the
+  ///        NAM_NO_EXCEPTIONS branch above.
+  #define NAM_DIAG_STREAM ::std::stringstream
 
   #define NAM_FAIL(status, msg) throw std::runtime_error(msg)
   #define NAM_FAIL_RET(status, msg, ret) throw std::runtime_error(msg)

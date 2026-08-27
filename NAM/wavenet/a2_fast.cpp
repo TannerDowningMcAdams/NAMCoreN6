@@ -17,7 +17,9 @@
   #include <cstring>
   #include <iterator>
   #include <memory>
-  #include <sstream>
+  #if !defined(NAM_NO_EXCEPTIONS)
+    #include <sstream>
+  #endif
   #include <stdexcept>
   #include <string>
   #include <utility>
@@ -283,9 +285,15 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
 
   if (it != end)
   {
+  #if defined(NAM_NO_EXCEPTIONS)
+    // The message is discarded in this build, so do not build one: <sstream>
+    // would otherwise be linked in purely to format text nobody reads.
+    NAM_FAIL(nam::Status::ErrorWeightCount, "");
+  #else
     std::stringstream ss;
     ss << "A2FastModel: weight stream has " << std::distance(it, end) << " trailing bytes";
     NAM_FAIL(nam::Status::ErrorWeightCount, ss.str());
+  #endif
   }
 }
 
