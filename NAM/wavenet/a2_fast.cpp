@@ -43,6 +43,31 @@
     #define NAM_A2_PROFILE 0
   #endif
 
+  // Which per-layer kernel a model uses. Values match a2_fast.h's Kernel enum.
+  //
+  //   0  Reference. Scalar, column-major history (frame-contiguous columns of
+  //      Channels floats). The original path; the golden output.
+  //   1  MveFrameMajor. Helium, frame-major history (channel-contiguous rows of
+  //      frames), so a vector load gets 4 consecutive frames of one channel and
+  //      the conv becomes vector-by-scalar FMAs with the accumulator resident
+  //      in Q registers across all K taps. Channels == 3 only.
+  //
+  // This is the compile-time default. With NAM_A2_BENCH the host can override
+  // it per model via SetKernelForNextModel(), which is how the two are compared
+  // head to head on target.
+  #ifndef NAM_A2_KERNEL_DEFAULT
+    #define NAM_A2_KERNEL_DEFAULT 0
+  #endif
+
+  // __ARM_FEATURE_MVE bit 1 is the floating-point half of Helium. Bit 0 alone
+  // (integer MVE) is not enough for any of this.
+  #if defined(__ARM_FEATURE_MVE) && ((__ARM_FEATURE_MVE) & 2)
+    #define NAM_A2_HAVE_MVE 1
+    #include <arm_mve.h>
+  #else
+    #define NAM_A2_HAVE_MVE 0
+  #endif
+
   #if NAM_A2_PROFILE
 /// Probe ids passed to the host's nam_a2_profile_* hooks.
 enum
@@ -92,6 +117,11 @@ namespace a2_fast
 
 namespace
 {
+
+/// Kernel that the next A2FastModel construction will adopt. Set through the
+/// public SetKernelForNextModel(); read once, in the constructor. Not
+/// thread-safe and not meant to be -- models are built during setup.
+int g_pending_kernel = NAM_A2_KERNEL_DEFAULT;
 
 // =============================================================================
 // A2FastModel<Channels>
@@ -151,16 +181,24 @@ private:
     std::array<float, Channels * Channels> l1x1_w{};
     std::array<float, Channels> l1x1_b{};
 
-    // Conv1D input history ring buffer, column-major (Channels rows).
+    // Conv1D input history ring buffer.
+    //
+    // Reference kernel: column-major -- (pow2_size + mbs) columns of Channels
+    // contiguous floats, so one column is one frame across all channels.
+    //
+    // MveFrameMajor kernel: transposed -- Channels rows of row_stride floats,
+    // so row c holds consecutive frames of channel c and four of them come in
+    // on one vector load. Total allocation is identical either way; only the
+    // interpretation differs, which is why SetMaxBufferSize() needs no branch.
     std::vector<float> history;
+    int row_stride = 0; // frame-major only: pow2_size + max_buffer_size
     std::array<float, Channels> cached_prewarm_state{};
   #if NAM_A2_RING_MODE == 1
     // pow2 ring + tail mirror. Storage = (pow2_size + max_buffer_size) cols.
     // write_pos is kept in [0, pow2_size), reads use (pos & pow2_mask) and are
     // always contiguous because cols [pow2_size, pow2_size + max_buffer_size)
     // mirror cols [0, max_buffer_size).
-    int pow2_size = 0;
-    int pow2_mask = 0;
+    int ring_size = 0;
     int write_pos = 0;
   #else
     // Linear ring with sporadic memmove-rewind. history_cols = 2*max_lookback +
@@ -188,8 +226,9 @@ private:
   std::vector<float> _head_history;
   std::array<float, Channels> _cached_head_prewarm_state{};
   #if NAM_A2_RING_MODE == 1
-  int _head_pow2_size = 0;
-  int _head_pow2_mask = 0;
+  int _head_ring_size = 0;
+  /// Frame-major only: floats per channel row of _head_history.
+  int _head_row_stride = 0;
   int _head_write_pos = 0;
   #else
   int _head_history_cols = 0;
@@ -215,6 +254,22 @@ private:
   void _layer_forward(int layer_idx, const float* cond, int num_frames);
   void _head_forward(float* output, int num_frames);
 
+  /// Which per-layer kernel this instance runs. See NAM_A2_KERNEL_DEFAULT.
+  /// Fixed at construction: the history layout depends on it, so it cannot
+  /// change once buffers are sized and warmed.
+  int _kernel = NAM_A2_KERNEL_DEFAULT;
+  bool _frame_major() const { return _kernel == 1 || _kernel == 2; }
+
+  #if NAM_A2_HAVE_MVE
+  void _ring_write_fm(Layer& L, int num_frames);
+  template <int KernelSize>
+  void _layer_forward_fm(Layer& L, const float* cond, int num_frames);
+  template <int KernelSize>
+  void _layer_forward_fm2(Layer& L, const float* cond, int num_frames);
+  void _head_ring_write_fm(int num_frames);
+  void _head_forward_fm(float* output, int num_frames);
+  #endif
+
   // Compile-time-specialized per-layer kernel. KernelSize is lifted to a
   // template parameter so clang can fully unroll the tap loop and schedule
   // FMAs across taps. For the A2 shape we only need K=6 and K=15.
@@ -229,6 +284,24 @@ template <int Channels>
 A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_sample_rate)
 : DSP(/*in_channels=*/1, /*out_channels=*/1, expected_sample_rate)
 {
+  // Latch the kernel choice for this instance now: the history layout follows
+  // from it, so it must be settled before SetMaxBufferSize() sizes anything.
+  _kernel = g_pending_kernel;
+  #if !NAM_A2_HAVE_MVE
+  _kernel = 0; // no Helium float on this target
+  #endif
+  #if NAM_A2_FIXED_BLOCK <= 0
+  // The frame-major kernel needs a compile-time block size: it vectorizes four
+  // frames at a time and sizes a transpose scratch from it.
+  _kernel = 0;
+  #endif
+  if constexpr (Channels != 3)
+  {
+    // The frame-major kernel is written against a 3-channel layer. A2-Full
+    // keeps the Eigen path, which already blocks over whole frames.
+    _kernel = 0;
+  }
+
   for (int i = 0; i < kNumLayers; i++)
   {
     _layers[i].kernel_size = kKernelSizes[i];
@@ -359,13 +432,25 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
 // -----------------------------------------------------------------------------
 namespace
 {
-// Smallest power of 2 >= v (v > 0).
-int next_pow2(int v)
+// Ring index wrapping for an exactly-sized (non power-of-two) ring.
+//
+// A conditional add/subtract rather than %, and a single one is always enough
+// because every caller is at most one ring away:
+//   - forward:  write_pos < size and the step is at most one block, itself <=
+//     size, so the sum is < 2*size.
+//   - backward: the deepest tap is write_pos - nf - max_lookback, and
+//     size == max_lookback + nf exactly, so the value is >= -size.
+// Costs one compare and one conditional op per tap against the mask it
+// replaces. That is ~156 extra instructions per block, against the ~19.5k
+// cycles of AXISRAM stall that fitting in DTCM removes.
+inline int wrap_fwd(int v, int size)
 {
-  int p = 1;
-  while (p < v)
-    p <<= 1;
-  return p;
+  return (v >= size) ? (v - size) : v;
+}
+
+inline int wrap_back(int v, int size)
+{
+  return (v < 0) ? (v + size) : v;
 }
 
 // Fixed-length non-overlapping float copy.
@@ -383,6 +468,18 @@ inline void copy_floats(float* __restrict dst, const float* __restrict src)
 {
   for (int i = 0; i < N; i++)
     dst[i] = src[i];
+}
+
+/// One block's worth of a single channel row: nf floats. Unrolled when the
+/// block size is compile-time. Ranges must not overlap.
+inline void copy_row(float* dst, const float* src, int nf)
+{
+  #if NAM_A2_FIXED_BLOCK > 0
+  (void)nf;
+  copy_floats<NAM_A2_FIXED_BLOCK>(dst, src);
+  #else
+  std::memcpy(dst, src, static_cast<size_t>(nf) * sizeof(float));
+  #endif
 }
 
 /// One block's worth of columns: nf * Channels floats. Unrolled when the block
@@ -425,9 +522,18 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   for (auto& L : _layers)
   {
   #if NAM_A2_RING_MODE == 1
-    L.pow2_size = next_pow2(L.max_lookback + maxBufferSize);
-    L.pow2_mask = L.pow2_size - 1;
-    L.history.assign(static_cast<size_t>(Channels) * (L.pow2_size + maxBufferSize), 0.0f);
+    // Exactly max_lookback + one block, no rounding. The read window is then
+    // precisely the whole ring: after writing this block's frames the deepest
+    // tap sits at the position the NEXT block will overwrite, so nothing is
+    // wasted and nothing is lost. Rounding up to a power of two, which is what
+    // this used to do to make the wrap a mask, cost 40% (131.4K vs 78.9K of
+    // history per model) and that 40% is the difference between two model
+    // instances fitting in DTCM and not.
+    L.ring_size = L.max_lookback + maxBufferSize;
+    L.history.assign(static_cast<size_t>(Channels) * (L.ring_size + maxBufferSize), 0.0f);
+    // Frame-major reads row c at [c * row_stride]; the reference kernel ignores
+    // this. Same allocation, different interpretation.
+    L.row_stride = L.ring_size + maxBufferSize;
     L.write_pos = L.max_lookback;
   #else
     L.history_cols = 2 * L.max_lookback + maxBufferSize;
@@ -438,9 +544,9 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
   const int head_lookback = kHeadKernelSize - 1;
   #if NAM_A2_RING_MODE == 1
-  _head_pow2_size = next_pow2(head_lookback + maxBufferSize);
-  _head_pow2_mask = _head_pow2_size - 1;
-  _head_history.assign(static_cast<size_t>(Channels) * (_head_pow2_size + maxBufferSize), 0.0f);
+  _head_ring_size = head_lookback + maxBufferSize;
+  _head_history.assign(static_cast<size_t>(Channels) * (_head_ring_size + maxBufferSize), 0.0f);
+  _head_row_stride = _head_ring_size + maxBufferSize;
   _head_write_pos = head_lookback;
   #else
   _head_history_cols = 2 * head_lookback + maxBufferSize;
@@ -475,19 +581,45 @@ void A2FastModel<Channels>::PrewarmFromCache()
   for (auto& L : _layers)
   {
     const size_t columns = L.history.size() / Channels;
-    for (size_t column = 0; column < columns; column++)
+    if (_frame_major())
     {
-      std::copy(L.cached_prewarm_state.begin(), L.cached_prewarm_state.end(),
-                L.history.begin() + static_cast<std::ptrdiff_t>(column * Channels));
+      // Row c is uniformly the cached value for channel c. Same steady state as
+      // the column-major fill below, written in the transposed layout.
+      for (int c = 0; c < Channels; c++)
+      {
+        float* row = L.history.data() + static_cast<size_t>(c) * L.row_stride;
+        for (int t = 0; t < L.row_stride; t++)
+          row[t] = L.cached_prewarm_state[c];
+      }
+    }
+    else
+    {
+      for (size_t column = 0; column < columns; column++)
+      {
+        std::copy(L.cached_prewarm_state.begin(), L.cached_prewarm_state.end(),
+                  L.history.begin() + static_cast<std::ptrdiff_t>(column * Channels));
+      }
     }
     L.write_pos = L.max_lookback;
   }
 
-  const size_t head_columns = _head_history.size() / Channels;
-  for (size_t column = 0; column < head_columns; column++)
+  if (_frame_major())
   {
-    std::copy(_cached_head_prewarm_state.begin(), _cached_head_prewarm_state.end(),
-              _head_history.begin() + static_cast<std::ptrdiff_t>(column * Channels));
+    for (int c = 0; c < Channels; c++)
+    {
+      float* row = _head_history.data() + static_cast<size_t>(c) * _head_row_stride;
+      for (int t = 0; t < _head_row_stride; t++)
+        row[t] = _cached_head_prewarm_state[c];
+    }
+  }
+  else
+  {
+    const size_t head_columns = _head_history.size() / Channels;
+    for (size_t column = 0; column < head_columns; column++)
+    {
+      std::copy(_cached_head_prewarm_state.begin(), _cached_head_prewarm_state.end(),
+                _head_history.begin() + static_cast<std::ptrdiff_t>(column * Channels));
+    }
   }
   _head_write_pos = kHeadKernelSize - 1;
 }
@@ -498,21 +630,37 @@ void A2FastModel<Channels>::CacheStateAsPrewarmed()
   for (auto& L : _layers)
   {
   #if NAM_A2_RING_MODE == 1
-    const int last_column = (L.write_pos - 1) & L.pow2_mask;
+    const int last_column = wrap_back(L.write_pos - 1, L.ring_size);
   #else
     const int last_column = L.write_pos - 1;
   #endif
-    std::copy_n(L.history.begin() + static_cast<std::ptrdiff_t>(last_column * Channels), Channels,
-                L.cached_prewarm_state.begin());
+    if (_frame_major())
+    {
+      for (int c = 0; c < Channels; c++)
+        L.cached_prewarm_state[c] = L.history[static_cast<size_t>(c) * L.row_stride + last_column];
+    }
+    else
+    {
+      std::copy_n(L.history.begin() + static_cast<std::ptrdiff_t>(last_column * Channels), Channels,
+                  L.cached_prewarm_state.begin());
+    }
   }
 
   #if NAM_A2_RING_MODE == 1
-  const int last_head_column = (_head_write_pos - 1) & _head_pow2_mask;
+  const int last_head_column = wrap_back(_head_write_pos - 1, _head_ring_size);
   #else
   const int last_head_column = _head_write_pos - 1;
   #endif
-  std::copy_n(_head_history.begin() + static_cast<std::ptrdiff_t>(last_head_column * Channels), Channels,
-              _cached_head_prewarm_state.begin());
+  if (_frame_major())
+  {
+    for (int c = 0; c < Channels; c++)
+      _cached_head_prewarm_state[c] = _head_history[static_cast<size_t>(c) * _head_row_stride + last_head_column];
+  }
+  else
+  {
+    std::copy_n(_head_history.begin() + static_cast<std::ptrdiff_t>(last_head_column * Channels), Channels,
+                _cached_head_prewarm_state.begin());
+  }
   _has_cached_prewarm_state = true;
 }
 
@@ -546,20 +694,31 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
   // which is a compile-time constant under NAM_A2_FIXED_BLOCK, so GCC expands
   // it inline. Folded into a min() the length is runtime-variable and every
   // block pays an out-of-line newlib memcpy per layer. The wrap path keeps the
-  // variable-length calls but only fires once per (pow2_size / nf) blocks.
-  if (wp + nf <= L.pow2_size)
+  // variable-length calls but only fires once per (ring_size / nf) blocks.
+  const bool wrapped = (wp + nf > L.ring_size);
+  if (!wrapped)
   {
     copy_block<Channels>(hist + static_cast<size_t>(wp) * Channels, src, nf);
   }
   else
   {
-    const int first = L.pow2_size - wp;
+    const int first = L.ring_size - wp;
     std::memcpy(hist + static_cast<size_t>(wp) * Channels, src, static_cast<size_t>(first) * Channels * sizeof(float));
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(nf - first) * Channels * sizeof(float));
   }
-  copy_block<Channels>(hist + static_cast<size_t>(L.pow2_size) * Channels, hist, mbs);
-  L.write_pos = (wp + nf) & L.pow2_mask;
+
+  // The tail mirror only goes stale when this write actually touched columns
+  // [0, mbs) -- either because it wrapped into them, or because it started
+  // inside them. Refreshing it unconditionally, which is what this did, costs
+  // a block-sized copy per layer per block to rewrite bytes that did not
+  // change. For the deep layers (ring 1203, block 8) the mirror is live about
+  // one block in 75; the other 74 were pure waste.
+  if (wrapped || wp < mbs)
+  {
+    copy_block<Channels>(hist + static_cast<size_t>(L.ring_size) * Channels, hist, mbs);
+  }
+  L.write_pos = wrap_fwd(wp + nf, L.ring_size);
   #else
   if (L.write_pos + nf > L.history_cols)
   {
@@ -573,6 +732,67 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
   L.write_pos += nf;
   #endif
 }
+
+  #if NAM_A2_HAVE_MVE
+// Frame-major ring write. Same pow2 + tail-mirror scheme as _ring_write, but
+// applied per channel row: row c holds consecutive frames, so a tap read is a
+// contiguous run and the mirror makes a wrapped read contiguous too.
+//
+// _layer_in is frame-major here as well, so the source for row c is its own
+// contiguous run -- this is a set of small straight copies, not a scatter.
+template <int Channels>
+void A2FastModel<Channels>::_ring_write_fm(Layer& L, int num_frames)
+{
+    #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames;
+    #else
+  const int nf = num_frames;
+  const int mbs = GetMaxBufferSize();
+    #endif
+
+  const int wp = L.write_pos;
+  const int stride = L.row_stride;
+  float* const hist = L.history.data();
+  const float* const src = _layer_in.data();
+
+  // Tail mirror: the first mbs frames repeated past ring_size, so a tap whose
+  // window straddles the wrap still reads one contiguous run. Stale only when
+  // this write touched [0, mbs) -- see the note in _ring_write.
+  const bool wrapped = (wp + nf > L.ring_size);
+  const bool mirror = wrapped || (wp < mbs);
+
+  for (int c = 0; c < Channels; c++)
+  {
+    float* row = hist + static_cast<size_t>(c) * stride;
+    const float* srow = src + static_cast<size_t>(c) * mbs;
+
+    if (!wrapped)
+    {
+      copy_row(row + wp, srow, nf);
+    }
+    else
+    {
+      // memcpy, not element loops. `first` is a runtime length, and GCC gives
+      // such a loop its fully versioned vectorizer treatment -- runtime trip
+      // count, an alignment guard, and a scalar fallback -- which is a lot of
+      // code for a path that runs about one block in 150. The column-major
+      // _ring_write already used memcpy here; this matches it.
+      const int first = L.ring_size - wp;
+      std::memcpy(row + wp, srow, static_cast<size_t>(first) * sizeof(float));
+      std::memcpy(row, srow + first, static_cast<size_t>(nf - first) * sizeof(float));
+    }
+
+    if (mirror)
+    {
+      copy_row(row + L.ring_size, row, mbs);
+    }
+  }
+
+  L.write_pos = wrap_fwd(wp + nf, L.ring_size);
+}
+  #endif // NAM_A2_HAVE_MVE
 
 template <int Channels>
 void A2FastModel<Channels>::_head_ring_write(int num_frames)
@@ -590,22 +810,39 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
 
   #if NAM_A2_RING_MODE == 1
   float* const hist = _head_history.data();
+
+  // Column-major head history, for the reference kernel only. The frame-major
+  // kernels use _head_ring_write_fm, which needs no transpose: _head_sum is
+  // already frame-major when they produce it, so the copy is row to row.
   const float* const src = _head_sum.data();
+
   const int wp = _head_write_pos;
   // Same no-wrap split as _ring_write, for the same reason.
-  if (wp + nf <= _head_pow2_size)
+  const bool wrapped = (wp + nf > _head_ring_size);
+  if (!wrapped)
   {
     copy_block<Channels>(hist + static_cast<size_t>(wp) * Channels, src, nf);
   }
   else
   {
-    const int first = _head_pow2_size - wp;
+    const int first = _head_ring_size - wp;
     std::memcpy(hist + static_cast<size_t>(wp) * Channels, src, static_cast<size_t>(first) * Channels * sizeof(float));
     std::memcpy(hist, src + static_cast<size_t>(first) * Channels,
                 static_cast<size_t>(nf - first) * Channels * sizeof(float));
   }
-  copy_block<Channels>(hist + static_cast<size_t>(_head_pow2_size) * Channels, hist, mbs);
-  _head_write_pos = (wp + nf) & _head_pow2_mask;
+
+  // Conditional for the same reason as the layer mirror. Note the head mirror
+  // is not actually read at present: _head_forward wraps every column index
+  // individually through col_of(), so a head read never spans the wrap. It is
+  // kept, rather than deleted, because vectorising the head means reading
+  // contiguous runs of frames, and that does need it. The head ring is short
+  // (23 columns to a block of 8), so this skips maybe 60% of the copies rather
+  // than the ~99% the deep layers skip.
+  if (wrapped || wp < mbs)
+  {
+    copy_block<Channels>(hist + static_cast<size_t>(_head_ring_size) * Channels, hist, mbs);
+  }
+  _head_write_pos = wrap_fwd(wp + nf, _head_ring_size);
   #else
   const int keep = kHeadKernelSize - 1;
   if (_head_write_pos + nf > _head_history_cols)
@@ -646,8 +883,8 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   // reads spanning the wrap land in the tail mirror; in linear mode write_pos
   // is monotonic and arithmetic is plain.
   #if NAM_A2_RING_MODE == 1
-  const int mask = L.pow2_mask;
-  auto tap_base_phys = [&](int taps_back) { return (L.write_pos - nf - taps_back * D) & mask; };
+  const int rsz = L.ring_size;
+  auto tap_base_phys = [&](int taps_back) { return wrap_back(L.write_pos - nf - taps_back * D, rsz); };
   #else
   const int base = L.write_pos - nf;
   auto tap_base_phys = [&](int taps_back) { return base - taps_back * D; };
@@ -838,6 +1075,298 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   }
 }
 
+  #if NAM_A2_HAVE_MVE
+// -----------------------------------------------------------------------------
+// Frame-major Helium kernel (Channels == 3).
+//
+// Layout is the whole point. With the history transposed so that row c holds
+// consecutive frames of channel c, one vldrw.32 fetches four frames of one
+// channel, and the 3x3 GEMV becomes vector-by-scalar FMAs:
+//
+//     z_i[f..f+3] += w[j*3 + i] * x_j[f..f+3]
+//
+// where x_j is a vector load and the weight is a scalar in a general register.
+// Nine VFMAs cover four frames of the full 3x3, against 36 scalar FMAs in the
+// reference kernel -- and the three accumulators stay in Q registers across all
+// K taps instead of round-tripping through _z.
+//
+// Bit-exactness: per lane, the accumulation order is identical to the reference
+// kernel (seed with conv_b, then tap 0 j=0,1,2, tap 1 j=0,1,2, ...). Lanes are
+// independent, so this should agree to the bit, not merely to a tolerance. The
+// on-target harness checks exactly that.
+//
+// nf is a multiple of 4 (asserted below), processed as nf/4 vector groups.
+// -----------------------------------------------------------------------------
+template <int Channels>
+template <int KernelSize>
+void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int num_frames)
+{
+  static_assert(Channels == 3, "frame-major kernel is written for a 3-channel layer");
+  constexpr int K = KernelSize;
+
+    #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames;
+  static_assert(nf % 4 == 0, "frame-major kernel processes 4 frames per vector");
+    #else
+  const int nf = num_frames;
+  const int mbs = GetMaxBufferSize();
+    #endif
+
+  // _layer_in / _head_sum are Channels rows of max_buffer_size, so the row
+  // stride is mbs -- not nf, which is only equal to it under a fixed block.
+  const int rs = mbs;
+
+  const int D = L.dilation;
+  const int rsz = L.ring_size;
+  const int stride = L.row_stride;
+  const float* const hist = L.history.data();
+
+  // Physical frame index of this block's first frame, taps_back*D in the past.
+  // The tail mirror guarantees [base, base + nf) is contiguous within a row.
+  auto tap_base = [&](int taps_back) { return wrap_back(L.write_pos - nf - taps_back * D, rsz); };
+
+  float* const lin = _layer_in.data();
+  float* const hsum = _head_sum.data();
+
+  const float* const cw = L.conv_w.data();
+  const float* const lw = L.l1x1_w.data();
+
+  for (int g = 0; g < nf; g += 4)
+  {
+    // Accumulators for this group of four frames, one per output channel,
+    // resident in Q registers for the whole tap loop.
+    float32x4_t z0 = vdupq_n_f32(L.conv_b[0]);
+    float32x4_t z1 = vdupq_n_f32(L.conv_b[1]);
+    float32x4_t z2 = vdupq_n_f32(L.conv_b[2]);
+
+    for (int k = 0; k < K; k++)
+    {
+      const float* w = cw + static_cast<size_t>(k) * 9;
+      const int b = tap_base(K - 1 - k) + g;
+      const float32x4_t x0 = vld1q_f32(hist + b);
+      const float32x4_t x1 = vld1q_f32(hist + stride + b);
+      const float32x4_t x2 = vld1q_f32(hist + 2 * stride + b);
+
+      // w[j*3 + i] is input j -> output i, matching the reference kernel's
+      // w0..w8 ordering exactly.
+      z0 = vfmaq_n_f32(z0, x0, w[0]);
+      z1 = vfmaq_n_f32(z1, x0, w[1]);
+      z2 = vfmaq_n_f32(z2, x0, w[2]);
+      z0 = vfmaq_n_f32(z0, x1, w[3]);
+      z1 = vfmaq_n_f32(z1, x1, w[4]);
+      z2 = vfmaq_n_f32(z2, x1, w[5]);
+      z0 = vfmaq_n_f32(z0, x2, w[6]);
+      z1 = vfmaq_n_f32(z1, x2, w[7]);
+      z2 = vfmaq_n_f32(z2, x2, w[8]);
+    }
+
+    // Mixin.
+    const float32x4_t cf = vld1q_f32(cond + g);
+    z0 = vfmaq_n_f32(z0, cf, L.mixin_w[0]);
+    z1 = vfmaq_n_f32(z1, cf, L.mixin_w[1]);
+    z2 = vfmaq_n_f32(z2, cf, L.mixin_w[2]);
+
+    // LeakyReLU as a predicated multiply: lanes below zero get scaled, the rest
+    // are left alone. Two instructions and no flag traffic, unlike the scalar
+    // path's VCMPE/VMRS pair -- which is free to be slow there because it is a
+    // third of the work here.
+    z0 = vmulq_m_n_f32(z0, z0, kLeakySlope, vcmpltq_n_f32(z0, 0.0f));
+    z1 = vmulq_m_n_f32(z1, z1, kLeakySlope, vcmpltq_n_f32(z1, 0.0f));
+    z2 = vmulq_m_n_f32(z2, z2, kLeakySlope, vcmpltq_n_f32(z2, 0.0f));
+
+    // Head-sum accumulate, frame-major rows.
+    vst1q_f32(hsum + g, vaddq_f32(vld1q_f32(hsum + g), z0));
+    vst1q_f32(hsum + rs + g, vaddq_f32(vld1q_f32(hsum + rs + g), z1));
+    vst1q_f32(hsum + 2 * rs + g, vaddq_f32(vld1q_f32(hsum + 2 * rs + g), z2));
+
+    // layer1x1 residual: lin_i += l1x1_b[i] + sum_b lw[b*3 + i] * z_b.
+    //
+    // Grouped exactly as the reference writes it -- the bias-seeded sum is
+    // formed first and added to lin as one step. Hoisting the load of lin into
+    // the accumulator instead would be algebraically the same but a different
+    // rounding sequence, and would cost the bit-exact comparison.
+    float32x4_t t0 = vdupq_n_f32(L.l1x1_b[0]);
+    float32x4_t t1 = vdupq_n_f32(L.l1x1_b[1]);
+    float32x4_t t2 = vdupq_n_f32(L.l1x1_b[2]);
+    t0 = vfmaq_n_f32(t0, z0, lw[0]);
+    t1 = vfmaq_n_f32(t1, z0, lw[1]);
+    t2 = vfmaq_n_f32(t2, z0, lw[2]);
+    t0 = vfmaq_n_f32(t0, z1, lw[3]);
+    t1 = vfmaq_n_f32(t1, z1, lw[4]);
+    t2 = vfmaq_n_f32(t2, z1, lw[5]);
+    t0 = vfmaq_n_f32(t0, z2, lw[6]);
+    t1 = vfmaq_n_f32(t1, z2, lw[7]);
+    t2 = vfmaq_n_f32(t2, z2, lw[8]);
+    vst1q_f32(lin + g, vaddq_f32(vld1q_f32(lin + g), t0));
+    vst1q_f32(lin + rs + g, vaddq_f32(vld1q_f32(lin + rs + g), t1));
+    vst1q_f32(lin + 2 * rs + g, vaddq_f32(vld1q_f32(lin + 2 * rs + g), t2));
+  }
+}
+// -----------------------------------------------------------------------------
+// Frame-major Helium kernel, both frame groups carried through the tap loop.
+//
+// Same math and same layout as _layer_forward_fm; only the loop nest differs.
+// That kernel wraps the tap loop inside the group loop, so every weight is
+// re-loaded for each group of four frames -- the generated code is a strict
+// alternation of `ldr` and `vfma.f32 q`, one scalar load per vector FMA, and
+// the tap's address arithmetic (mask, scale, three row offsets) is likewise
+// paid twice.
+//
+// Here both groups live across the tap loop, so a weight is loaded once and
+// feeds two FMAs, and the tap addressing is computed once. The tap base also
+// advances by +D per tap rather than being recomputed with a multiply.
+//
+// Register budget is exactly the 8 Q registers MVE has: six accumulators
+// (3 channels x 2 groups) plus two in-flight input vectors, which is why the
+// inputs are consumed one channel at a time rather than all three being held.
+// If this spills it will show up as *worse* than fm, which is precisely the
+// kind of thing the harness is for.
+// -----------------------------------------------------------------------------
+template <int Channels>
+template <int KernelSize>
+void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int num_frames)
+{
+  static_assert(Channels == 3, "frame-major kernel is written for a 3-channel layer");
+  constexpr int K = KernelSize;
+
+    #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames;
+  static_assert(nf == 8, "fm2 carries exactly two 4-frame groups");
+    #else
+  const int nf = num_frames;
+  const int mbs = GetMaxBufferSize();
+    #endif
+
+  const int rs = mbs;
+  const int D = L.dilation;
+  const int rsz = L.ring_size;
+  const int stride = L.row_stride;
+
+  // Row bases hoisted out of the tap loop: they are loop-invariant, but the
+  // compiler recomputes hist + n*stride + b per tap when they are not.
+  const float* const row0 = L.history.data();
+  const float* const row1 = row0 + stride;
+  const float* const row2 = row1 + stride;
+
+  float* const lin = _layer_in.data();
+  float* const hsum = _head_sum.data();
+  const float* const cw = L.conv_w.data();
+  const float* const lw = L.l1x1_w.data();
+
+  float32x4_t z0a = vdupq_n_f32(L.conv_b[0]);
+  float32x4_t z0b = z0a;
+  float32x4_t z1a = vdupq_n_f32(L.conv_b[1]);
+  float32x4_t z1b = z1a;
+  float32x4_t z2a = vdupq_n_f32(L.conv_b[2]);
+  float32x4_t z2b = z2a;
+
+  // Deepest tap first, then +D per tap: the same sequence tap_base(K-1-k)
+  // produces, without the per-tap multiply.
+  // With the ring sized exactly max_lookback + nf, the deepest tap base is
+  // (write_pos - nf - max_lookback) mod ring_size, and nf + max_lookback IS
+  // ring_size -- so it reduces to write_pos itself, with no arithmetic at all.
+  int b = L.write_pos;
+
+  for (int k = 0; k < K; k++)
+  {
+    const float* w = cw + static_cast<size_t>(k) * 9;
+
+    // One input vector live at a time: six accumulators plus one input is seven
+    // Q registers, leaving one spare. Holding both groups' inputs at once needs
+    // all eight and GCC spills, which costs more than the reload it saves. The
+    // three weights of each row still serve both groups from GP registers.
+    float32x4_t x = vld1q_f32(row0 + b);
+    z0a = vfmaq_n_f32(z0a, x, w[0]);
+    z1a = vfmaq_n_f32(z1a, x, w[1]);
+    z2a = vfmaq_n_f32(z2a, x, w[2]);
+    x = vld1q_f32(row0 + b + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[0]);
+    z1b = vfmaq_n_f32(z1b, x, w[1]);
+    z2b = vfmaq_n_f32(z2b, x, w[2]);
+
+    x = vld1q_f32(row1 + b);
+    z0a = vfmaq_n_f32(z0a, x, w[3]);
+    z1a = vfmaq_n_f32(z1a, x, w[4]);
+    z2a = vfmaq_n_f32(z2a, x, w[5]);
+    x = vld1q_f32(row1 + b + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[3]);
+    z1b = vfmaq_n_f32(z1b, x, w[4]);
+    z2b = vfmaq_n_f32(z2b, x, w[5]);
+
+    x = vld1q_f32(row2 + b);
+    z0a = vfmaq_n_f32(z0a, x, w[6]);
+    z1a = vfmaq_n_f32(z1a, x, w[7]);
+    z2a = vfmaq_n_f32(z2a, x, w[8]);
+    x = vld1q_f32(row2 + b + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[6]);
+    z1b = vfmaq_n_f32(z1b, x, w[7]);
+    z2b = vfmaq_n_f32(z2b, x, w[8]);
+
+    b = wrap_fwd(b + D, rsz);
+  }
+
+  // Post-conv tail, identical to fm but for both groups.
+  const float32x4_t ca = vld1q_f32(cond);
+  const float32x4_t cb = vld1q_f32(cond + 4);
+  z0a = vfmaq_n_f32(z0a, ca, L.mixin_w[0]);
+  z0b = vfmaq_n_f32(z0b, cb, L.mixin_w[0]);
+  z1a = vfmaq_n_f32(z1a, ca, L.mixin_w[1]);
+  z1b = vfmaq_n_f32(z1b, cb, L.mixin_w[1]);
+  z2a = vfmaq_n_f32(z2a, ca, L.mixin_w[2]);
+  z2b = vfmaq_n_f32(z2b, cb, L.mixin_w[2]);
+
+  z0a = vmulq_m_n_f32(z0a, z0a, kLeakySlope, vcmpltq_n_f32(z0a, 0.0f));
+  z0b = vmulq_m_n_f32(z0b, z0b, kLeakySlope, vcmpltq_n_f32(z0b, 0.0f));
+  z1a = vmulq_m_n_f32(z1a, z1a, kLeakySlope, vcmpltq_n_f32(z1a, 0.0f));
+  z1b = vmulq_m_n_f32(z1b, z1b, kLeakySlope, vcmpltq_n_f32(z1b, 0.0f));
+  z2a = vmulq_m_n_f32(z2a, z2a, kLeakySlope, vcmpltq_n_f32(z2a, 0.0f));
+  z2b = vmulq_m_n_f32(z2b, z2b, kLeakySlope, vcmpltq_n_f32(z2b, 0.0f));
+
+  vst1q_f32(hsum, vaddq_f32(vld1q_f32(hsum), z0a));
+  vst1q_f32(hsum + 4, vaddq_f32(vld1q_f32(hsum + 4), z0b));
+  vst1q_f32(hsum + rs, vaddq_f32(vld1q_f32(hsum + rs), z1a));
+  vst1q_f32(hsum + rs + 4, vaddq_f32(vld1q_f32(hsum + rs + 4), z1b));
+  vst1q_f32(hsum + 2 * rs, vaddq_f32(vld1q_f32(hsum + 2 * rs), z2a));
+  vst1q_f32(hsum + 2 * rs + 4, vaddq_f32(vld1q_f32(hsum + 2 * rs + 4), z2b));
+
+  float32x4_t t0a = vdupq_n_f32(L.l1x1_b[0]);
+  float32x4_t t0b = t0a;
+  float32x4_t t1a = vdupq_n_f32(L.l1x1_b[1]);
+  float32x4_t t1b = t1a;
+  float32x4_t t2a = vdupq_n_f32(L.l1x1_b[2]);
+  float32x4_t t2b = t2a;
+  t0a = vfmaq_n_f32(t0a, z0a, lw[0]);
+  t0b = vfmaq_n_f32(t0b, z0b, lw[0]);
+  t1a = vfmaq_n_f32(t1a, z0a, lw[1]);
+  t1b = vfmaq_n_f32(t1b, z0b, lw[1]);
+  t2a = vfmaq_n_f32(t2a, z0a, lw[2]);
+  t2b = vfmaq_n_f32(t2b, z0b, lw[2]);
+  t0a = vfmaq_n_f32(t0a, z1a, lw[3]);
+  t0b = vfmaq_n_f32(t0b, z1b, lw[3]);
+  t1a = vfmaq_n_f32(t1a, z1a, lw[4]);
+  t1b = vfmaq_n_f32(t1b, z1b, lw[4]);
+  t2a = vfmaq_n_f32(t2a, z1a, lw[5]);
+  t2b = vfmaq_n_f32(t2b, z1b, lw[5]);
+  t0a = vfmaq_n_f32(t0a, z2a, lw[6]);
+  t0b = vfmaq_n_f32(t0b, z2b, lw[6]);
+  t1a = vfmaq_n_f32(t1a, z2a, lw[7]);
+  t1b = vfmaq_n_f32(t1b, z2b, lw[7]);
+  t2a = vfmaq_n_f32(t2a, z2a, lw[8]);
+  t2b = vfmaq_n_f32(t2b, z2b, lw[8]);
+
+  vst1q_f32(lin, vaddq_f32(vld1q_f32(lin), t0a));
+  vst1q_f32(lin + 4, vaddq_f32(vld1q_f32(lin + 4), t0b));
+  vst1q_f32(lin + rs, vaddq_f32(vld1q_f32(lin + rs), t1a));
+  vst1q_f32(lin + rs + 4, vaddq_f32(vld1q_f32(lin + rs + 4), t1b));
+  vst1q_f32(lin + 2 * rs, vaddq_f32(vld1q_f32(lin + 2 * rs), t2a));
+  vst1q_f32(lin + 2 * rs + 4, vaddq_f32(vld1q_f32(lin + 2 * rs + 4), t2b));
+}
+  #endif // NAM_A2_HAVE_MVE
+
 // Runtime dispatcher: selects the K-specialized kernel for this layer.
 // For the A2 shape the detector only admits K in {6, 15}; any other value
 // here means something passed the detector that shouldn't have.
@@ -845,6 +1374,38 @@ template <int Channels>
 void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int num_frames)
 {
   Layer& L = _layers[layer_idx];
+
+  #if NAM_A2_HAVE_MVE
+  if constexpr (Channels == 3)
+  {
+    if (_frame_major())
+    {
+      _ring_write_fm(L, num_frames);
+      NAM_A2_PROF_ENTER(kNamA2ProbeLayerMath);
+      if (_kernel == 2)
+      {
+        switch (L.kernel_size)
+        {
+          case 6: _layer_forward_fm2<6>(L, cond, num_frames); break;
+          case 15: _layer_forward_fm2<15>(L, cond, num_frames); break;
+          default: NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: unexpected kernel_size"); break;
+        }
+      }
+      else
+      {
+        switch (L.kernel_size)
+        {
+          case 6: _layer_forward_fm<6>(L, cond, num_frames); break;
+          case 15: _layer_forward_fm<15>(L, cond, num_frames); break;
+          default: NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: unexpected kernel_size"); break;
+        }
+      }
+      NAM_A2_PROF_EXIT(kNamA2ProbeLayerMath);
+      return;
+    }
+  }
+  #endif
+
   _ring_write(L, num_frames);
   NAM_A2_PROF_ENTER(kNamA2ProbeLayerMath);
   switch (L.kernel_size)
@@ -861,9 +1422,133 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
 // -----------------------------------------------------------------------------
 // Head: K=16 dilation-1 conv from Channels to 1, plus bias + scale.
 // -----------------------------------------------------------------------------
+  #if NAM_A2_HAVE_MVE
+// Frame-major head ring write. The layer version, applied to the head's own
+// (much shorter) ring: 23 columns to a block of 8.
+template <int Channels>
+void A2FastModel<Channels>::_head_ring_write_fm(int num_frames)
+{
+    #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames;
+    #else
+  const int nf = num_frames;
+  const int mbs = GetMaxBufferSize();
+    #endif
+
+  const int wp = _head_write_pos;
+  const int stride = _head_row_stride;
+  float* const hist = _head_history.data();
+  const float* const src = _head_sum.data();
+
+  const bool wrapped = (wp + nf > _head_ring_size);
+  // Unlike the old scalar head, the mirror is now genuinely load-bearing:
+  // _head_forward_fm reads four consecutive frames of a row at a time, so a
+  // window straddling the wrap lands in it.
+  const bool mirror = wrapped || (wp < mbs);
+
+  for (int c = 0; c < Channels; c++)
+  {
+    float* row = hist + static_cast<size_t>(c) * stride;
+    const float* srow = src + static_cast<size_t>(c) * mbs;
+
+    if (!wrapped)
+    {
+      copy_row(row + wp, srow, nf);
+    }
+    else
+    {
+      const int first = _head_ring_size - wp;
+      std::memcpy(row + wp, srow, static_cast<size_t>(first) * sizeof(float));
+      std::memcpy(row, srow + first, static_cast<size_t>(nf - first) * sizeof(float));
+    }
+
+    if (mirror)
+    {
+      copy_row(row + _head_ring_size, row, mbs);
+    }
+  }
+
+  _head_write_pos = wrap_fwd(wp + nf, _head_ring_size);
+}
+
+// -----------------------------------------------------------------------------
+// Frame-major Helium head.
+//
+// The head is a K=16, dilation-1 conv from Channels to 1. Scalar and
+// column-major it was 16 taps x 3 channels x 8 frames = 384 FMAs with a load
+// each -- the last unvectorised arithmetic in the block.
+//
+// Transposed, the columns a given tap reads for four consecutive frames are
+// themselves consecutive, so each (tap, channel) is one vector load and one
+// vector-by-scalar FMA: 96 vector FMAs in place of 384 scalar ones. The
+// accumulator stays in a Q register across all 16 taps, and the per-block
+// _head_sum transpose that the column-major layout forced disappears with it.
+//
+// Per lane the accumulation order matches the scalar head exactly -- seed with
+// _head_b, then tap 0 channels 0,1,2, tap 1 channels 0,1,2, ...
+// -----------------------------------------------------------------------------
+template <int Channels>
+void A2FastModel<Channels>::_head_forward_fm(float* output, int num_frames)
+{
+  static_assert(Channels == 3, "frame-major head is written for a 3-channel layer");
+
+  _head_ring_write_fm(num_frames);
+
+    #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  (void)num_frames;
+  static_assert(nf % 4 == 0, "frame-major head processes 4 frames per vector");
+    #else
+  const int nf = num_frames;
+    #endif
+
+  const int rsz = _head_ring_size;
+  const int stride = _head_row_stride;
+  const float* const row0 = _head_history.data();
+  const float* const row1 = row0 + stride;
+  const float* const row2 = row1 + stride;
+
+  // First frame of this block, in ring coordinates. Can be negative; every
+  // column index below is wrapped once, which is enough because the most
+  // negative value it reaches is exactly -rsz.
+  const int base = _head_write_pos - nf;
+
+  for (int g = 0; g < nf; g += 4)
+  {
+    float32x4_t y = vdupq_n_f32(_head_b);
+
+    for (int k = 0; k < kHeadKernelSize; k++)
+    {
+      // For a fixed tap, frames g..g+3 read columns c0..c0+3 -- contiguous,
+      // which is the whole reason for the transpose.
+      const int c0 = wrap_back(base - (kHeadKernelSize - 1 - k) + g, rsz);
+      const float* const w = _head_w[k].data();
+      y = vfmaq_n_f32(y, vld1q_f32(row0 + c0), w[0]);
+      y = vfmaq_n_f32(y, vld1q_f32(row1 + c0), w[1]);
+      y = vfmaq_n_f32(y, vld1q_f32(row2 + c0), w[2]);
+    }
+
+    vst1q_f32(output + g, vmulq_n_f32(y, _head_scale));
+  }
+}
+  #endif // NAM_A2_HAVE_MVE
+
 template <int Channels>
 void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
 {
+  #if NAM_A2_HAVE_MVE
+  if constexpr (Channels == 3)
+  {
+    if (_frame_major())
+    {
+      _head_forward_fm(output, num_frames);
+      return;
+    }
+  }
+  #endif
+
   _head_ring_write(num_frames);
   #if NAM_A2_FIXED_BLOCK > 0
   constexpr int nf = kFixedBlock;
@@ -872,8 +1557,8 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
   const int nf = num_frames;
   #endif
   #if NAM_A2_RING_MODE == 1
-  const int mask = _head_pow2_mask;
-  auto col_of = [&](int f, int k) { return (_head_write_pos - nf + f - (kHeadKernelSize - 1 - k)) & mask; };
+  const int rsz = _head_ring_size;
+  auto col_of = [&](int f, int k) { return wrap_back(_head_write_pos - nf + f - (kHeadKernelSize - 1 - k), rsz); };
   #else
   const int base = _head_write_pos - nf;
   auto col_of = [&](int f, int k) { return base + f - (kHeadKernelSize - 1 - k); };
@@ -924,13 +1609,28 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   // Rechannel: layer_in[c, f] = _rechannel_w[c] * input[f] for c in Channels.
   // Also prepare float cond buffer (input copied to float for inner loops).
   float* cond = _cond.data();
-  for (int f = 0; f < nf; f++)
+  if (_frame_major())
   {
-    const float x = static_cast<float>(in0[f]);
-    cond[f] = x;
-    float* lin = &_layer_in[static_cast<size_t>(f) * Channels];
-    for (int c = 0; c < Channels; c++)
-      lin[c] = _rechannel_w[c] * x;
+    // _layer_in laid out as Channels rows of max_buffer_size frames.
+    const int rs = GetMaxBufferSize();
+    for (int f = 0; f < nf; f++)
+    {
+      const float x = static_cast<float>(in0[f]);
+      cond[f] = x;
+      for (int c = 0; c < Channels; c++)
+        _layer_in[static_cast<size_t>(c) * rs + f] = _rechannel_w[c] * x;
+    }
+  }
+  else
+  {
+    for (int f = 0; f < nf; f++)
+    {
+      const float x = static_cast<float>(in0[f]);
+      cond[f] = x;
+      float* lin = &_layer_in[static_cast<size_t>(f) * Channels];
+      for (int c = 0; c < Channels; c++)
+        lin[c] = _rechannel_w[c] * x;
+    }
   }
 
   // Zero head accumulator.
@@ -1315,6 +2015,16 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(int channels)
   auto out = std::make_unique<A2FastConfig>();
   out->channels = channels;
   return out;
+}
+
+void SetKernelForNextModel(Kernel k)
+{
+  g_pending_kernel = static_cast<int>(k);
+}
+
+Kernel GetPendingKernel()
+{
+  return static_cast<Kernel>(g_pending_kernel);
 }
 
 } // namespace a2_fast

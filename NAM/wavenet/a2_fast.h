@@ -75,6 +75,42 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(const nlohmann::json& config,
 /// \pre is_a2_shape() returned true and produced this channel count.
 std::unique_ptr<ModelConfig> create_a2_fast_config(int channels);
 
+/// \brief Per-layer kernel implementation.
+///
+/// The history layout follows from this, so it is fixed when the model is
+/// constructed and cannot be changed afterwards.
+enum class Kernel
+{
+  /// Scalar, column-major history. The reference implementation and the
+  /// golden output that the others are checked against.
+  Reference = 0,
+  /// Helium, frame-major (transposed) history. Requires Channels == 3, a
+  /// compile-time block size that is a multiple of 4, and MVE float support;
+  /// falls back to Reference when any of those is missing.
+  MveFrameMajor = 1,
+  /// As MveFrameMajor, same layout and same math, but both 4-frame groups are
+  /// carried through the tap loop so each weight load feeds two FMAs and the
+  /// tap addressing is computed once instead of twice. Requires a block of
+  /// exactly 8 frames.
+  MveFrameMajorWide = 2
+};
+
+/// \brief Select the kernel that the NEXT model construction will adopt.
+///
+/// Exists so a host can build one model per kernel and compare them on target
+/// for both cycles and output. Sticky: it applies to every subsequent
+/// construction until changed. Not thread-safe -- call it during setup.
+///
+/// Requests that the build cannot satisfy are silently downgraded to
+/// Reference, so the caller should read back GetKernel() on the model it got
+/// rather than assume. There is no way to ask an existing model to change.
+void SetKernelForNextModel(Kernel k);
+
+/// \brief Kernel most recently selected by SetKernelForNextModel().
+/// Note this is the *requested* kernel, not necessarily what a given model
+/// adopted -- see the downgrade note above.
+Kernel GetPendingKernel();
+
 } // namespace a2_fast
 } // namespace wavenet
 } // namespace nam
