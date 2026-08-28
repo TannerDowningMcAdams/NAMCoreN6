@@ -123,6 +123,10 @@ namespace
 /// thread-safe and not meant to be -- models are built during setup.
 int g_pending_kernel = NAM_A2_KERNEL_DEFAULT;
 
+/// Arena the next A2FastModel construction will take its weight block from.
+/// Null means the heap. Read once, in the constructor, and captured there.
+const WeightArena* g_weight_arena = nullptr;
+
 // =============================================================================
 // A2FastModel<Channels>
 //
@@ -153,7 +157,7 @@ public:
   #endif
 
   A2FastModel(std::vector<float> weights, double expected_sample_rate);
-  ~A2FastModel() override = default;
+  ~A2FastModel() override;
 
   void process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames) override;
   void prewarm() override;
@@ -171,15 +175,16 @@ private:
 
     // Dilated conv (Channels -> Bottleneck), column-major per tap.
     // Flat size = kernel_size * Channels * Bottleneck.
-    std::vector<float> conv_w;
-    std::array<float, Channels> conv_b{};
+    // Views into the model-wide weight block (see WeightArena). Not owned.
+    float* conv_w = nullptr;   // kernel_size * Channels * Channels
+    float* conv_b = nullptr;   // Channels
 
     // Input mixin (cond_size=1 -> Bottleneck), no bias.
-    std::array<float, Channels> mixin_w{};
+    float* mixin_w = nullptr;  // Channels
 
     // layer1x1 (Bottleneck -> Channels), with bias. Column-major (Channels × Bottleneck).
-    std::array<float, Channels * Channels> l1x1_w{};
-    std::array<float, Channels> l1x1_b{};
+    float* l1x1_w = nullptr;   // Channels * Channels
+    float* l1x1_b = nullptr;   // Channels
 
     // Conv1D input history ring buffer.
     //
@@ -211,11 +216,11 @@ private:
   std::array<Layer, kNumLayers> _layers;
 
   // Rechannel (input_size=1 -> Channels), no bias.
-  std::array<float, Channels> _rechannel_w{};
+  float* _rechannel_w = nullptr;  // Channels
 
   // Head rechannel (Bottleneck -> 1), kernel=16, bias. Column-major per tap.
   // At each tap, matrix is (1 × Channels) col-major -> Channels floats.
-  std::array<std::array<float, Channels>, kHeadKernelSize> _head_w{};
+  float* _head_w = nullptr;       // kHeadKernelSize * Channels, tap-major
   float _head_b = 0.0f;
 
   // Head scale is stored as the trailing float in the weights stream (the generic
@@ -241,6 +246,16 @@ private:
   std::vector<float> _z; // per-layer conv output accumulator (tap-major)
   std::vector<float> _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
   std::vector<float> _head_out; // float32 head output before writing to NAM_SAMPLE
+
+  /// Every weight, in one contiguous block -- see weight_block_floats(). Held
+  /// as one allocation so the arena needs only alloc/release once per model,
+  /// with no fragmentation to manage and no ordering constraints between the
+  /// object's lifetime and its weights'.
+  float* _weights = nullptr;
+  /// The arena this model's block came from, captured at construction. Null
+  /// means the block is a plain heap array. Stored rather than re-read from
+  /// the global so a later SetWeightArena() cannot strand it.
+  const WeightArena* _arena = nullptr;
 
   int _prewarm_samples = 0;
   bool _has_cached_prewarm_state = false;
@@ -302,12 +317,57 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     _kernel = 0;
   }
 
+  // One block for every weight, from the arena when one is set. Falling back
+  // to the heap rather than failing keeps a full pool from turning into a
+  // silent bypass: the model still runs, just from slower memory.
+  constexpr int kBlockFloats = weight_block_floats(Channels);
+  const std::size_t bytes = static_cast<std::size_t>(kBlockFloats) * sizeof(float);
+
+  if (g_weight_arena != nullptr && g_weight_arena->alloc != nullptr)
+  {
+    _weights = static_cast<float*>(g_weight_arena->alloc(bytes, g_weight_arena->ctx));
+    if (_weights != nullptr)
+      _arena = g_weight_arena;
+  }
+  if (_weights == nullptr)
+  {
+    _weights = new float[kBlockFloats];
+  }
+  for (int i = 0; i < kBlockFloats; i++)
+    _weights[i] = 0.0f;
+
+  // Carve the block. Order is arbitrary but must match nothing else -- the
+  // load order in _load_weights() is what the file format fixes, not this.
+  float* p = _weights;
+  _rechannel_w = p;
+  p += Channels;
+
   for (int i = 0; i < kNumLayers; i++)
   {
-    _layers[i].kernel_size = kKernelSizes[i];
-    _layers[i].dilation = kDilations[i];
-    _layers[i].max_lookback = (kKernelSizes[i] - 1) * kDilations[i];
-    _layers[i].conv_w.assign(static_cast<size_t>(kKernelSizes[i]) * Channels * Channels, 0.0f);
+    Layer& L = _layers[i];
+    L.kernel_size = kKernelSizes[i];
+    L.dilation = kDilations[i];
+    L.max_lookback = (kKernelSizes[i] - 1) * kDilations[i];
+
+    L.conv_w = p;
+    p += static_cast<size_t>(kKernelSizes[i]) * Channels * Channels;
+    L.conv_b = p;
+    p += Channels;
+    L.mixin_w = p;
+    p += Channels;
+    L.l1x1_w = p;
+    p += Channels * Channels;
+    L.l1x1_b = p;
+    p += Channels;
+  }
+
+  _head_w = p;
+  p += kHeadKernelSize * Channels;
+
+  // If this trips, weight_block_floats() and the carve above have drifted.
+  if (p != _weights + kBlockFloats)
+  {
+    NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: weight block layout mismatch");
   }
 
   _load_weights(weights);
@@ -321,6 +381,20 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     prewarm += _layers[i].max_lookback;
   prewarm += kHeadKernelSize - 1;
   _prewarm_samples = prewarm;
+}
+
+template <int Channels>
+A2FastModel<Channels>::~A2FastModel()
+{
+  // Released to whichever arena issued it, not to whichever is current.
+  if (_weights != nullptr)
+  {
+    if (_arena != nullptr && _arena->release != nullptr)
+      _arena->release(_weights, _arena->ctx);
+    else
+      delete[] _weights;
+    _weights = nullptr;
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -405,7 +479,7 @@ void A2FastModel<Channels>::_load_weights(std::vector<float>& weights)
   {
     for (int k = 0; k < kHeadKernelSize; k++)
     {
-      _head_w[k][j] = take();
+      _head_w[k * Channels + j] = take();
     }
   }
   _head_b = take();
@@ -1044,10 +1118,10 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     using VecC = Eigen::Matrix<float, Channels, 1>;
     using RowDyn = Eigen::Matrix<float, 1, Eigen::Dynamic>;
 
-    Eigen::Map<const VecC> conv_b_vec(L.conv_b.data());
-    Eigen::Map<const VecC> mixin_vec(L.mixin_w.data());
-    Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w.data());
-    Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b.data());
+    Eigen::Map<const VecC> conv_b_vec(L.conv_b);
+    Eigen::Map<const VecC> mixin_vec(L.mixin_w);
+    Eigen::Map<const MatCC> l1x1_mat(L.l1x1_w);
+    Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b);
     Eigen::Map<const RowDyn> cond_row(cond, 1, nf);
 
     Eigen::Map<MatCDyn> ztile(_z.data(), Channels, nf);
@@ -1121,17 +1195,22 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
   const int D = L.dilation;
   const int rsz = L.ring_size;
   const int stride = L.row_stride;
-  const float* const hist = L.history.data();
+  const float* __restrict const hist = L.history.data();
 
   // Physical frame index of this block's first frame, taps_back*D in the past.
   // The tail mirror guarantees [base, base + nf) is contiguous within a row.
   auto tap_base = [&](int taps_back) { return wrap_back(L.write_pos - nf - taps_back * D, rsz); };
 
-  float* const lin = _layer_in.data();
-  float* const hsum = _head_sum.data();
+  float* __restrict const lin = _layer_in.data();
+  float* __restrict const hsum = _head_sum.data();
 
-  const float* const cw = L.conv_w.data();
-  const float* const lw = L.l1x1_w.data();
+  // __restrict is honest here -- the weight block is written once at load time
+  // and is read-only from the kernels. Measured as codegen-neutral on GCC 14.3
+  // (byte-identical output), so it is documentation and future-proofing, not a
+  // fix: it was tried as a candidate for the regression noted below and was not
+  // the cause.
+  const float* __restrict const cw = L.conv_w;
+  const float* __restrict const lw = L.l1x1_w;
 
   for (int g = 0; g < nf; g += 4)
   {
@@ -1235,7 +1314,12 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   constexpr int nf = kFixedBlock;
   constexpr int mbs = kFixedBlock;
   (void)num_frames;
-  static_assert(nf == 8, "fm2 carries exactly two 4-frame groups");
+  // Eight, not four: this kernel's whole point is carrying TWO 4-frame groups
+  // through the tap loop so one weight load feeds two FMAs. Blocks larger than
+  // 8 are handled by repeating that pair, not by widening it -- six
+  // accumulators plus an input already occupy seven of the eight Q registers,
+  // so a third group would spill and give back more than it saves.
+  static_assert(nf % 8 == 0, "fm2 processes whole pairs of 4-frame groups");
     #else
   const int nf = num_frames;
   const int mbs = GetMaxBufferSize();
@@ -1248,14 +1332,29 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
 
   // Row bases hoisted out of the tap loop: they are loop-invariant, but the
   // compiler recomputes hist + n*stride + b per tap when they are not.
-  const float* const row0 = L.history.data();
+  const float* __restrict const row0 = L.history.data();
   const float* const row1 = row0 + stride;
   const float* const row2 = row1 + stride;
 
-  float* const lin = _layer_in.data();
-  float* const hsum = _head_sum.data();
-  const float* const cw = L.conv_w.data();
-  const float* const lw = L.l1x1_w.data();
+  float* __restrict const lin = _layer_in.data();
+  float* __restrict const hsum = _head_sum.data();
+  // __restrict is honest here -- the weight block is written once at load time
+  // and is read-only from the kernels. Measured as codegen-neutral on GCC 14.3
+  // (byte-identical output), so it is documentation and future-proofing, not a
+  // fix: it was tried as a candidate for the regression noted below and was not
+  // the cause.
+  const float* __restrict const cw = L.conv_w;
+  const float* __restrict const lw = L.l1x1_w;
+
+  // One pass per pair of 4-frame groups. At nf == 8 this runs once and costs
+  // nothing; at larger blocks it repeats, which is what keeps the register
+  // budget fixed as the block grows.
+  for (int g0 = 0; g0 < nf; g0 += 8)
+  {
+  // Frame-offset bases, so the body below needs no g0 in any expression.
+  const float* const cg = cond + g0;
+  float* __restrict const hg = hsum + g0;
+  float* __restrict const lg = lin + g0;
 
   float32x4_t z0a = vdupq_n_f32(L.conv_b[0]);
   float32x4_t z0b = z0a;
@@ -1266,10 +1365,12 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
 
   // Deepest tap first, then +D per tap: the same sequence tap_base(K-1-k)
   // produces, without the per-tap multiply.
-  // With the ring sized exactly max_lookback + nf, the deepest tap base is
-  // (write_pos - nf - max_lookback) mod ring_size, and nf + max_lookback IS
-  // ring_size -- so it reduces to write_pos itself, with no arithmetic at all.
-  int b = L.write_pos;
+  // With the ring sized exactly max_lookback + nf, the deepest tap base for
+  // frame 0 is (write_pos - nf - max_lookback) mod ring_size, and
+  // nf + max_lookback IS ring_size -- so it reduces to write_pos. Frame g0
+  // starts g0 further on, and one wrap is enough because write_pos < ring_size
+  // and g0 < nf <= ring_size.
+  int b = wrap_fwd(L.write_pos + g0, rsz);
 
   for (int k = 0; k < K; k++)
   {
@@ -1310,8 +1411,8 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   }
 
   // Post-conv tail, identical to fm but for both groups.
-  const float32x4_t ca = vld1q_f32(cond);
-  const float32x4_t cb = vld1q_f32(cond + 4);
+  const float32x4_t ca = vld1q_f32(cg);
+  const float32x4_t cb = vld1q_f32(cg + 4);
   z0a = vfmaq_n_f32(z0a, ca, L.mixin_w[0]);
   z0b = vfmaq_n_f32(z0b, cb, L.mixin_w[0]);
   z1a = vfmaq_n_f32(z1a, ca, L.mixin_w[1]);
@@ -1326,12 +1427,12 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   z2a = vmulq_m_n_f32(z2a, z2a, kLeakySlope, vcmpltq_n_f32(z2a, 0.0f));
   z2b = vmulq_m_n_f32(z2b, z2b, kLeakySlope, vcmpltq_n_f32(z2b, 0.0f));
 
-  vst1q_f32(hsum, vaddq_f32(vld1q_f32(hsum), z0a));
-  vst1q_f32(hsum + 4, vaddq_f32(vld1q_f32(hsum + 4), z0b));
-  vst1q_f32(hsum + rs, vaddq_f32(vld1q_f32(hsum + rs), z1a));
-  vst1q_f32(hsum + rs + 4, vaddq_f32(vld1q_f32(hsum + rs + 4), z1b));
-  vst1q_f32(hsum + 2 * rs, vaddq_f32(vld1q_f32(hsum + 2 * rs), z2a));
-  vst1q_f32(hsum + 2 * rs + 4, vaddq_f32(vld1q_f32(hsum + 2 * rs + 4), z2b));
+  vst1q_f32(hg, vaddq_f32(vld1q_f32(hg), z0a));
+  vst1q_f32(hg + 4, vaddq_f32(vld1q_f32(hg + 4), z0b));
+  vst1q_f32(hg + rs, vaddq_f32(vld1q_f32(hg + rs), z1a));
+  vst1q_f32(hg + rs + 4, vaddq_f32(vld1q_f32(hg + rs + 4), z1b));
+  vst1q_f32(hg + 2 * rs, vaddq_f32(vld1q_f32(hg + 2 * rs), z2a));
+  vst1q_f32(hg + 2 * rs + 4, vaddq_f32(vld1q_f32(hg + 2 * rs + 4), z2b));
 
   float32x4_t t0a = vdupq_n_f32(L.l1x1_b[0]);
   float32x4_t t0b = t0a;
@@ -1358,12 +1459,13 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   t2a = vfmaq_n_f32(t2a, z2a, lw[8]);
   t2b = vfmaq_n_f32(t2b, z2b, lw[8]);
 
-  vst1q_f32(lin, vaddq_f32(vld1q_f32(lin), t0a));
-  vst1q_f32(lin + 4, vaddq_f32(vld1q_f32(lin + 4), t0b));
-  vst1q_f32(lin + rs, vaddq_f32(vld1q_f32(lin + rs), t1a));
-  vst1q_f32(lin + rs + 4, vaddq_f32(vld1q_f32(lin + rs + 4), t1b));
-  vst1q_f32(lin + 2 * rs, vaddq_f32(vld1q_f32(lin + 2 * rs), t2a));
-  vst1q_f32(lin + 2 * rs + 4, vaddq_f32(vld1q_f32(lin + 2 * rs + 4), t2b));
+  vst1q_f32(lg, vaddq_f32(vld1q_f32(lg), t0a));
+  vst1q_f32(lg + 4, vaddq_f32(vld1q_f32(lg + 4), t0b));
+  vst1q_f32(lg + rs, vaddq_f32(vld1q_f32(lg + rs), t1a));
+  vst1q_f32(lg + rs + 4, vaddq_f32(vld1q_f32(lg + rs + 4), t1b));
+  vst1q_f32(lg + 2 * rs, vaddq_f32(vld1q_f32(lg + 2 * rs), t2a));
+  vst1q_f32(lg + 2 * rs + 4, vaddq_f32(vld1q_f32(lg + 2 * rs + 4), t2b));
+  } // frame-pair chunk
 }
   #endif // NAM_A2_HAVE_MVE
 
@@ -1524,7 +1626,7 @@ void A2FastModel<Channels>::_head_forward_fm(float* output, int num_frames)
       // For a fixed tap, frames g..g+3 read columns c0..c0+3 -- contiguous,
       // which is the whole reason for the transpose.
       const int c0 = wrap_back(base - (kHeadKernelSize - 1 - k) + g, rsz);
-      const float* const w = _head_w[k].data();
+      const float* const w = _head_w + k * Channels;
       y = vfmaq_n_f32(y, vld1q_f32(row0 + c0), w[0]);
       y = vfmaq_n_f32(y, vld1q_f32(row1 + c0), w[1]);
       y = vfmaq_n_f32(y, vld1q_f32(row2 + c0), w[2]);
@@ -1571,7 +1673,7 @@ void A2FastModel<Channels>::_head_forward(float* output, int num_frames)
     {
       const int col = col_of(f, k);
       const float* src = &_head_history[static_cast<size_t>(col) * Channels];
-      const float* wk = _head_w[k].data();
+      const float* wk = _head_w + k * Channels;
       for (int b = 0; b < Channels; b++)
         y += wk[b] * src[b];
     }
@@ -2020,6 +2122,11 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(int channels)
 void SetKernelForNextModel(Kernel k)
 {
   g_pending_kernel = static_cast<int>(k);
+}
+
+void SetWeightArena(const WeightArena* arena)
+{
+  g_weight_arena = arena;
 }
 
 Kernel GetPendingKernel()

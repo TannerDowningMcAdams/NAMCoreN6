@@ -111,6 +111,57 @@ void SetKernelForNextModel(Kernel k);
 /// adopted -- see the downgrade note above.
 Kernel GetPendingKernel();
 
+/// \brief Floats in one model's weight block, for a given channel count.
+///
+/// Every weight the model owns lives in one contiguous block: the rechannel
+/// vector, then per layer the dilated conv kernel, its bias, the input mixin
+/// and the 1x1 with its bias, then the head kernel. (head_bias and head_scale
+/// are two scalars and stay in the object.)
+///
+/// This is a compile-time constant because is_a2_shape() admits exactly one
+/// geometry -- captures differ in weight *values*, never in shape. A host can
+/// therefore size a pool with a static_assert rather than a guess.
+constexpr int weight_block_floats(int channels)
+{
+  int n = channels; // rechannel
+  for (int i = 0; i < kNumLayers; i++)
+  {
+    n += kKernelSizes[i] * channels * channels // conv kernel
+         + channels                            // conv bias
+         + channels                            // input mixin
+         + channels * channels                 // layer 1x1
+         + channels;                           // layer 1x1 bias
+  }
+  n += kHeadKernelSize * channels; // head kernel
+  return n;
+}
+
+/// \brief Somewhere other than the heap to put model weights.
+///
+/// The weights are ~8% of a model's bytes but roughly 30% of its per-block
+/// memory traffic -- every tap reads nine of them, 156 times a block, while
+/// ~79K of ring history streams past and evicts them. That density is what
+/// makes them worth pinning in fast memory when the histories cannot be.
+///
+/// One alloc and one release per model, so a fixed-slot pool is a sufficient
+/// implementation; there is no fragmentation to manage.
+struct WeightArena
+{
+  /// Allocate `bytes`, aligned to at least 16. Return nullptr when full --
+  /// the model then falls back to the heap rather than failing to build.
+  void* (*alloc)(std::size_t bytes, void* ctx);
+  /// Release a block previously returned by alloc(). Never called with null.
+  void (*release)(void* block, void* ctx);
+  void* ctx;
+};
+
+/// \brief Route weight allocation for subsequently constructed models.
+///
+/// Sticky, like SetKernelForNextModel(). Pass nullptr to go back to the heap.
+/// A model captures the arena at construction and uses that same one to
+/// release, so changing this later cannot strand an existing model's block.
+void SetWeightArena(const WeightArena* arena);
+
 } // namespace a2_fast
 } // namespace wavenet
 } // namespace nam
