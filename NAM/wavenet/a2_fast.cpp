@@ -2,59 +2,44 @@
 
   // Ring-buffer strategy:
   //   0 = linear memmove-rewind (variable worst-case latency, sporadic spikes)
-  //   1 = pow2 + tail mirror (constant per-block work, branchless reads)
+  //   1 = exactly-sized ring + tail mirror (constant per-block work)
   // Controlled externally with -DNAM_A2_RING_MODE=0 for head-to-head comparison.
   #ifndef NAM_A2_RING_MODE
     #define NAM_A2_RING_MODE 1
   #endif
 
-  // Compile-time model block size, in frames. 0 = dynamic (upstream behaviour:
-  // the block size is whatever Reset()/SetMaxBufferSize() was given).
+  // Compile-time model block size, in frames. 0 = dynamic, i.e. whatever
+  // Reset()/SetMaxBufferSize() was given.
   //
-  // Setting it turns num_frames and GetMaxBufferSize() into compile-time
-  // constants through the whole hot path, which buys two things on Cortex-M
-  // that matter more the smaller the block is:
+  // Setting it makes num_frames and GetMaxBufferSize() compile-time constants
+  // through the hot path, which matters more the smaller the block is: the ring
+  // writes' memcpy sizes become constants and inline rather than 48 calls to
+  // newlib per block, and the per-frame loops become constant-trip, so the z
+  // accumulator stays in registers across taps instead of spilling to _z.
   //
-  //   - the std::memcpy sizes in the ring writes become constants, so GCC
-  //     expands them inline instead of calling newlib's memcpy. At a 8-frame
-  //     block that is 48 out-of-line calls per block, each moving <= 96 bytes,
-  //     and newlib's generic memcpy is poor on this core.
-  //
-  //   - the per-frame loops become constant-trip, so GCC can fully unroll them
-  //     and keep the z accumulator in registers across taps instead of
-  //     reloading and restoring it from _z on every tap.
-  //
-  // A model whose block size does not match is refused in process() rather
-  // than run: every bound below would be wrong.
+  // A model whose block size does not match is refused in process(): every
+  // bound below would be wrong.
   #ifndef NAM_A2_FIXED_BLOCK
     #define NAM_A2_FIXED_BLOCK 0
   #endif
 
-  // Optional external profiling probes, off by default.
-  //
-  // This library must not depend on firmware headers, so the probe is a pair of
-  // extern "C" symbols the host image supplies. Enable with -DNAM_A2_PROFILE=1
-  // and define both; leave it off and the calls vanish entirely.
-  //
-  // Probe ids are deliberately coarse. Per-layer probing costs 23x as much and
-  // says nothing the aggregate does not: the accumulators on the host side sum
-  // across calls, so bracketing every layer already yields the total share.
+  // Optional external profiling probes, off by default. This library must not
+  // depend on firmware headers, so the probe is a pair of extern "C" symbols
+  // the host image supplies; enable with -DNAM_A2_PROFILE=1 and define both.
+  // Probe ids are coarse on purpose - per-layer probing costs 23x as much and
+  // the host-side accumulators already sum across calls.
   #ifndef NAM_A2_PROFILE
     #define NAM_A2_PROFILE 0
   #endif
 
-  // Which per-layer kernel a model uses. Values match a2_fast.h's Kernel enum.
+  // Compile-time default per-layer kernel; values match a2_fast.h's Kernel.
+  // NAM_A2_BENCH lets the host override it per model through
+  // SetKernelForNextModel(), which is how the two are compared on target.
   //
-  //   0  Reference. Scalar, column-major history (frame-contiguous columns of
-  //      Channels floats). The original path; the golden output.
-  //   1  MveFrameMajor. Helium, frame-major history (channel-contiguous rows of
-  //      frames), so a vector load gets 4 consecutive frames of one channel and
-  //      the conv becomes vector-by-scalar FMAs with the accumulator resident
-  //      in Q registers across all K taps. Channels == 3 only.
-  //
-  // This is the compile-time default. With NAM_A2_BENCH the host can override
-  // it per model via SetKernelForNextModel(), which is how the two are compared
-  // head to head on target.
+  //   0  Reference. Scalar, column-major history. The golden output.
+  //   1  MveFrameMajor. Helium, frame-major history, so one vector load gets 4
+  //      consecutive frames of a channel and the conv becomes vector-by-scalar
+  //      FMAs with the accumulator resident across all K taps. Channels == 3.
   #ifndef NAM_A2_KERNEL_DEFAULT
     #define NAM_A2_KERNEL_DEFAULT 0
   #endif
@@ -130,8 +115,6 @@ const WeightArena* g_weight_arena = nullptr;
 // =============================================================================
 // A2FastModel<Channels>
 //
-// Skeleton implementation: correct but not yet optimized.
-//
 // Architectural invariants (checked once by is_a2_shape before we get here):
 //   - single layer array with 23 layers
 //   - Bottleneck == Channels
@@ -186,23 +169,18 @@ private:
     float* l1x1_w = nullptr;   // Channels * Channels
     float* l1x1_b = nullptr;   // Channels
 
-    // Conv1D input history ring buffer.
-    //
-    // Reference kernel: column-major -- (pow2_size + mbs) columns of Channels
-    // contiguous floats, so one column is one frame across all channels.
-    //
-    // MveFrameMajor kernel: transposed -- Channels rows of row_stride floats,
-    // so row c holds consecutive frames of channel c and four of them come in
-    // on one vector load. Total allocation is identical either way; only the
-    // interpretation differs, which is why SetMaxBufferSize() needs no branch.
+    // Conv1D input history ring buffer. Reference kernel reads it column-major
+    // (one column = one frame across all channels); MveFrameMajor reads it
+    // transposed, row c holding consecutive frames of channel c so four arrive
+    // on one vector load. Same allocation either way, which is why
+    // SetMaxBufferSize() needs no branch.
     std::vector<float> history;
-    int row_stride = 0; // frame-major only: pow2_size + max_buffer_size
+    int row_stride = 0; // frame-major only: ring_size + max_buffer_size
     std::array<float, Channels> cached_prewarm_state{};
   #if NAM_A2_RING_MODE == 1
-    // pow2 ring + tail mirror. Storage = (pow2_size + max_buffer_size) cols.
-    // write_pos is kept in [0, pow2_size), reads use (pos & pow2_mask) and are
-    // always contiguous because cols [pow2_size, pow2_size + max_buffer_size)
-    // mirror cols [0, max_buffer_size).
+    // Exactly-sized ring + tail mirror. Storage = (ring_size + max_buffer_size)
+    // cols; write_pos stays in [0, ring_size) and reads are contiguous because
+    // the tail cols mirror cols [0, max_buffer_size).
     int ring_size = 0;
     int write_pos = 0;
   #else
@@ -508,15 +486,12 @@ namespace
 {
 // Ring index wrapping for an exactly-sized (non power-of-two) ring.
 //
-// A conditional add/subtract rather than %, and a single one is always enough
-// because every caller is at most one ring away:
-//   - forward:  write_pos < size and the step is at most one block, itself <=
-//     size, so the sum is < 2*size.
-//   - backward: the deepest tap is write_pos - nf - max_lookback, and
-//     size == max_lookback + nf exactly, so the value is >= -size.
-// Costs one compare and one conditional op per tap against the mask it
-// replaces. That is ~156 extra instructions per block, against the ~19.5k
-// cycles of AXISRAM stall that fitting in DTCM removes.
+// A conditional add/subtract rather than %, and one is always enough because
+// every caller is at most one ring away: forward, the step is at most one block
+// and a block is <= size; backward, the deepest tap is write_pos - nf -
+// max_lookback and size == max_lookback + nf exactly. ~156 extra instructions
+// per block, against the ~19.5k cycles of AXISRAM stall that fitting the
+// exactly-sized ring into DTCM removes.
 inline int wrap_fwd(int v, int size)
 {
   return (v >= size) ? (v - size) : v;
@@ -527,16 +502,12 @@ inline int wrap_back(int v, int size)
   return (v < 0) ? (v + size) : v;
 }
 
-// Fixed-length non-overlapping float copy.
+// Fixed-length non-overlapping float copy. Not std::memcpy: even at a constant
+// length GCC declines to expand a 96-byte copy inline here and calls newlib,
+// which the ring writes would do ~48 times a block. A constant-trip float loop
+// unrolls into load/store pairs with no call and no size test.
 //
-// Not std::memcpy: even with a compile-time constant length, GCC declines to
-// expand a 96-byte copy inline on this target and emits a call to newlib's
-// memcpy, which is poor on Cortex-M -- and at an 8-frame block the ring writes
-// would make ~48 such calls per block, all of them 96 bytes. Written as a
-// constant-trip loop over floats it is fully unrolled into load/store pairs
-// with no call, no alignment dispatch, and no size test.
-//
-// Callers must guarantee the ranges do not overlap; both ring-write uses do.
+// Callers must guarantee the ranges do not overlap; both ring writes do.
 template <int N>
 inline void copy_floats(float* __restrict dst, const float* __restrict src)
 {
@@ -596,13 +567,11 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   for (auto& L : _layers)
   {
   #if NAM_A2_RING_MODE == 1
-    // Exactly max_lookback + one block, no rounding. The read window is then
-    // precisely the whole ring: after writing this block's frames the deepest
-    // tap sits at the position the NEXT block will overwrite, so nothing is
-    // wasted and nothing is lost. Rounding up to a power of two, which is what
-    // this used to do to make the wrap a mask, cost 40% (131.4K vs 78.9K of
-    // history per model) and that 40% is the difference between two model
-    // instances fitting in DTCM and not.
+    // Exactly max_lookback + one block, no rounding: the read window is then
+    // precisely the whole ring, with the deepest tap sitting where the NEXT
+    // block writes. Rounding up to a power of two to make the wrap a mask costs
+    // 40% (131.4K vs 78.9K per model), which is the difference between two
+    // model instances fitting in DTCM and not.
     L.ring_size = L.max_lookback + maxBufferSize;
     L.history.assign(static_cast<size_t>(Channels) * (L.ring_size + maxBufferSize), 0.0f);
     // Frame-major reads row c at [c * row_stride]; the reference kernel ignores
@@ -740,11 +709,10 @@ void A2FastModel<Channels>::CacheStateAsPrewarmed()
 
 // -----------------------------------------------------------------------------
 // Ring-write helpers.
-//   Mode 1: pow2 + tail mirror. Constant-time per block (one short memcpy
-//   into the ring, one mirror refresh).
-//   Mode 0: linear with periodic memmove rewind. When write_pos nears the
-//   end of history, memmove the trailing max_lookback cols back to offset 0
-//   and reset write_pos. That memmove is the jitter spike we're measuring.
+//   Mode 1: exactly-sized ring + tail mirror. Constant work per block - one
+//   short memcpy into the ring, one mirror refresh.
+//   Mode 0: linear, with a memmove rewind whenever write_pos nears the end of
+//   history. That memmove is the jitter spike mode 1 exists to remove.
 // -----------------------------------------------------------------------------
 template <int Channels>
 void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
@@ -782,12 +750,10 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
                 static_cast<size_t>(nf - first) * Channels * sizeof(float));
   }
 
-  // The tail mirror only goes stale when this write actually touched columns
-  // [0, mbs) -- either because it wrapped into them, or because it started
-  // inside them. Refreshing it unconditionally, which is what this did, costs
-  // a block-sized copy per layer per block to rewrite bytes that did not
-  // change. For the deep layers (ring 1203, block 8) the mirror is live about
-  // one block in 75; the other 74 were pure waste.
+  // The mirror only goes stale when this write touched columns [0, mbs), by
+  // wrapping into them or starting inside them. Refreshing unconditionally
+  // costs a block-sized copy per layer per block; for the deep layers (ring
+  // 1203, block 8) the mirror is live about one block in 75.
   if (wrapped || wp < mbs)
   {
     copy_block<Channels>(hist + static_cast<size_t>(L.ring_size) * Channels, hist, mbs);
@@ -808,12 +774,10 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
 }
 
   #if NAM_A2_HAVE_MVE
-// Frame-major ring write. Same pow2 + tail-mirror scheme as _ring_write, but
+// Frame-major ring write. Same ring + tail-mirror scheme as _ring_write, but
 // applied per channel row: row c holds consecutive frames, so a tap read is a
-// contiguous run and the mirror makes a wrapped read contiguous too.
-//
-// _layer_in is frame-major here as well, so the source for row c is its own
-// contiguous run -- this is a set of small straight copies, not a scatter.
+// contiguous run and the mirror makes a wrapped read contiguous too. _layer_in
+// is frame-major as well, so these are small straight copies, not a scatter.
 template <int Channels>
 void A2FastModel<Channels>::_ring_write_fm(Layer& L, int num_frames)
 {
@@ -905,13 +869,10 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
                 static_cast<size_t>(nf - first) * Channels * sizeof(float));
   }
 
-  // Conditional for the same reason as the layer mirror. Note the head mirror
-  // is not actually read at present: _head_forward wraps every column index
-  // individually through col_of(), so a head read never spans the wrap. It is
-  // kept, rather than deleted, because vectorising the head means reading
-  // contiguous runs of frames, and that does need it. The head ring is short
-  // (23 columns to a block of 8), so this skips maybe 60% of the copies rather
-  // than the ~99% the deep layers skip.
+  // Conditional for the same reason as the layer mirror, though it skips only
+  // ~60% of the copies here against the deep layers' ~99%. Nothing reads this
+  // mirror yet - _head_forward wraps each column through col_of() - but
+  // vectorising the head means contiguous frame runs, which will need it.
   if (wrapped || wp < mbs)
   {
     copy_block<Channels>(hist + static_cast<size_t>(_head_ring_size) * Channels, hist, mbs);
@@ -936,10 +897,9 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
 // after applying dilated conv + mixin + LeakyReLU + layer1x1 residual, and
 // accumulates activations into _head_sum.
 // -----------------------------------------------------------------------------
-// Compile-time-specialized per-layer kernel. KernelSize is a template param
-// so the K tap loop + per-tap weight offsets become compile-time constants;
-// clang fully unrolls and can schedule FMAs across taps. Called from the
-// runtime dispatcher below for each A2 kernel size (6 and 15).
+// KernelSize is a template parameter so the tap loop and per-tap weight offsets
+// are compile-time constants and the compiler can unroll and schedule FMAs
+// across taps. Instantiated for the A2 kernel sizes, 6 and 15.
 template <int Channels>
 template <int KernelSize>
 void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int num_frames)
@@ -952,10 +912,9 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   #else
   const int nf = num_frames;
   #endif
-  // Physical ring position of this block's first frame, offset by `taps_back *
-  // D` samples into the past. In pow2 mode the position is wrapped by mask and
-  // reads spanning the wrap land in the tail mirror; in linear mode write_pos
-  // is monotonic and arithmetic is plain.
+  // Physical ring position of this block's first frame, `taps_back * D` samples
+  // into the past. In ring mode the position wraps and reads spanning the wrap
+  // land in the tail mirror; in linear mode write_pos is monotonic.
   #if NAM_A2_RING_MODE == 1
   const int rsz = L.ring_size;
   auto tap_base_phys = [&](int taps_back) { return wrap_back(L.write_pos - nf - taps_back * D, rsz); };
@@ -966,19 +925,15 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 
   // Two conv strategies, dispatched at compile time on Channels:
   //
-  //   - Channels <= 4 (A2-Lite): full-block tap-major. The z accumulator lives
-  //     in the heap buffer across all taps, and for each tap the inner f-loop
-  //     iterates over all nf. This gives clang frame-level
-  //     parallelism — it vectorizes across 4 frames at a time, which matters
-  //     more than weight-reload cost when the b-loop (3 wide) can't saturate
-  //     NEON lanes on its own.
+  //   - Channels <= 4 (A2-Lite): full-block tap-major, z living in the heap
+  //     buffer across all taps. Buys frame-level parallelism, which matters
+  //     more than weight-reload cost when a 3-wide b-loop cannot saturate the
+  //     lanes on its own.
   //
-  //   - Channels >= 8 (A2-Full): frame-tiled tap-major with T=4. ztile
-  //     stays in NEON registers across all K taps, amortizing weight loads
-  //     over 4 frames — equivalent to what a GEMM kernel does. Weight reuse
-  //     matters here because the b-loop (8 wide) already saturates SIMD, so
-  //     frame-level parallelism gives no extra headroom. The 1x1 residual is
-  //     also tiled over the same T=4 frames so W1x1 loads are amortized.
+  //   - Channels >= 8 (A2-Full): frame-tiled tap-major, T=4, with ztile
+  //     resident across all K taps so weight loads amortize over 4 frames, as
+  //     in a GEMM kernel. An 8-wide b-loop already saturates SIMD, so frame
+  //     parallelism adds nothing. The 1x1 residual is tiled the same way.
 
   if constexpr (Channels == 3)
   {
@@ -1076,13 +1031,10 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
       a0 += mw0 * cf;
       a1 += mw1 * cf;
       a2 += mw2 * cf;
-      // The ternary below compiles to VCMPE.F32 -> VMRS APSR_nzcv, fpscr -> IT/VMULMI, and
-      // that VMRS drains the FP pipeline (552 of them per block here). A
-      // branchless max(a,0) + slope*min(a,0) form removes them entirely --
-      // measured, it lowered to VMAXNM/VMINNM with no flag traffic as intended,
-      // and made the block *slightly slower*. The loop is not issue-limited on
-      // this path, so there is nothing to win here; keep the plain form, which
-      // also preserves the sign of zero exactly as the reference does.
+      // These ternaries lower to VCMPE/VMRS/VMULMI, 552 FP-pipeline drains a
+      // block. A branchless max(a,0) + slope*min(a,0) removes them and measures
+      // slightly slower - this loop is not issue-limited. Keep the plain form,
+      // which also preserves the sign of zero as the reference does.
       a0 = (a0 >= 0.0f) ? a0 : a0 * kLeakySlope;
       a1 = (a1 >= 0.0f) ? a1 : a1 * kLeakySlope;
       a2 = (a2 >= 0.0f) ? a2 : a2 * kLeakySlope;
@@ -1100,19 +1052,12 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
   }
   else
   {
-    // Use Eigen's tuned 8x8 × 8xN GEMM for the whole block at once. Unlike a
-    // small-tile version, this hits Eigen's actual GEMM kernel (tuned for
-    // inner dimensions of ~64) rather than its tiny-matrix fallback path.
-    //
-    // Compile-time improvements over the generic WaveNet path:
-    //   - Channels and Bottleneck are template constants (no dynamic shape).
-    //   - Per-layer buffers are pre-sized at SetMaxBufferSize; nothing resizes
-    //     during process().
-    //   - No FiLM / gating / head1x1 / grouped-conv branches.
-    //   - No virtual dispatch / conditional on optional layer features.
-    //   - All conv + post-conv ops operate on the full block — even the
-    //     mixin, bias, activation, and 1x1 residual are Eigen block ops so
-    //     they vectorize the same way the GEMMs do.
+    // Eigen's tuned 8x8 x 8xN GEMM over the whole block at once, which reaches
+    // the real GEMM kernel rather than the tiny-matrix fallback a small-tile
+    // version would get. Everything else follows from the shape being fixed at
+    // compile time: no dynamic shapes, no resizing during process(), no
+    // FiLM/gating/head1x1/grouped-conv branches, and every post-conv op is an
+    // Eigen block op that vectorizes like the GEMMs do.
     using MatCC = Eigen::Matrix<float, Channels, Channels>;
     using MatCDyn = Eigen::Matrix<float, Channels, Eigen::Dynamic>;
     using VecC = Eigen::Matrix<float, Channels, 1>;
@@ -1153,21 +1098,19 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 // -----------------------------------------------------------------------------
 // Frame-major Helium kernel (Channels == 3).
 //
-// Layout is the whole point. With the history transposed so that row c holds
+// Layout is the whole point. With the history transposed so row c holds
 // consecutive frames of channel c, one vldrw.32 fetches four frames of one
-// channel, and the 3x3 GEMV becomes vector-by-scalar FMAs:
+// channel and the 3x3 GEMV becomes vector-by-scalar FMAs:
 //
 //     z_i[f..f+3] += w[j*3 + i] * x_j[f..f+3]
 //
-// where x_j is a vector load and the weight is a scalar in a general register.
 // Nine VFMAs cover four frames of the full 3x3, against 36 scalar FMAs in the
-// reference kernel -- and the three accumulators stay in Q registers across all
-// K taps instead of round-tripping through _z.
+// reference kernel, and the three accumulators stay in Q registers across all K
+// taps instead of round-tripping through _z.
 //
-// Bit-exactness: per lane, the accumulation order is identical to the reference
-// kernel (seed with conv_b, then tap 0 j=0,1,2, tap 1 j=0,1,2, ...). Lanes are
-// independent, so this should agree to the bit, not merely to a tolerance. The
-// on-target harness checks exactly that.
+// Per lane the accumulation order matches the reference exactly, and lanes are
+// independent, so this agrees to the bit rather than to a tolerance. The
+// on-target harness checks that.
 //
 // nf is a multiple of 4 (asserted below), processed as nf/4 vector groups.
 // -----------------------------------------------------------------------------
@@ -1204,11 +1147,8 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
   float* __restrict const lin = _layer_in.data();
   float* __restrict const hsum = _head_sum.data();
 
-  // __restrict is honest here -- the weight block is written once at load time
-  // and is read-only from the kernels. Measured as codegen-neutral on GCC 14.3
-  // (byte-identical output), so it is documentation and future-proofing, not a
-  // fix: it was tried as a candidate for the regression noted below and was not
-  // the cause.
+  // __restrict is honest: the weight block is written once at load time and is
+  // read-only from the kernels. Codegen-neutral on GCC 14.3 - documentation.
   const float* __restrict const cw = L.conv_w;
   const float* __restrict const lw = L.l1x1_w;
 
@@ -1260,12 +1200,10 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
     vst1q_f32(hsum + rs + g, vaddq_f32(vld1q_f32(hsum + rs + g), z1));
     vst1q_f32(hsum + 2 * rs + g, vaddq_f32(vld1q_f32(hsum + 2 * rs + g), z2));
 
-    // layer1x1 residual: lin_i += l1x1_b[i] + sum_b lw[b*3 + i] * z_b.
-    //
-    // Grouped exactly as the reference writes it -- the bias-seeded sum is
-    // formed first and added to lin as one step. Hoisting the load of lin into
-    // the accumulator instead would be algebraically the same but a different
-    // rounding sequence, and would cost the bit-exact comparison.
+    // layer1x1 residual: lin_i += l1x1_b[i] + sum_b lw[b*3 + i] * z_b. Grouped
+    // as the reference writes it - bias-seeded sum first, added to lin as one
+    // step. Seeding the accumulator from lin instead is algebraically the same
+    // but rounds differently, which would cost the bit-exact comparison.
     float32x4_t t0 = vdupq_n_f32(L.l1x1_b[0]);
     float32x4_t t1 = vdupq_n_f32(L.l1x1_b[1]);
     float32x4_t t2 = vdupq_n_f32(L.l1x1_b[2]);
@@ -1286,22 +1224,16 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
 // -----------------------------------------------------------------------------
 // Frame-major Helium kernel, both frame groups carried through the tap loop.
 //
-// Same math and same layout as _layer_forward_fm; only the loop nest differs.
-// That kernel wraps the tap loop inside the group loop, so every weight is
-// re-loaded for each group of four frames -- the generated code is a strict
-// alternation of `ldr` and `vfma.f32 q`, one scalar load per vector FMA, and
-// the tap's address arithmetic (mask, scale, three row offsets) is likewise
-// paid twice.
+// Same math and layout as _layer_forward_fm; only the loop nest differs. That
+// kernel nests the tap loop inside the group loop, so every weight is reloaded
+// per group of four frames - a strict alternation of `ldr` and `vfma.f32 q` -
+// and the tap addressing is paid twice. Here both groups live across the tap
+// loop, so a weight load feeds two FMAs, the addressing is computed once, and
+// the tap base advances by +D rather than a multiply.
 //
-// Here both groups live across the tap loop, so a weight is loaded once and
-// feeds two FMAs, and the tap addressing is computed once. The tap base also
-// advances by +D per tap rather than being recomputed with a multiply.
-//
-// Register budget is exactly the 8 Q registers MVE has: six accumulators
-// (3 channels x 2 groups) plus two in-flight input vectors, which is why the
-// inputs are consumed one channel at a time rather than all three being held.
-// If this spills it will show up as *worse* than fm, which is precisely the
-// kind of thing the harness is for.
+// Register budget is exactly MVE's 8 Q registers: six accumulators (3 channels
+// x 2 groups) plus two in-flight inputs, which is why inputs are consumed one
+// channel at a time. A spill would show up as worse than fm on the harness.
 // -----------------------------------------------------------------------------
 template <int Channels>
 template <int KernelSize>
@@ -1314,11 +1246,9 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   constexpr int nf = kFixedBlock;
   constexpr int mbs = kFixedBlock;
   (void)num_frames;
-  // Eight, not four: this kernel's whole point is carrying TWO 4-frame groups
-  // through the tap loop so one weight load feeds two FMAs. Blocks larger than
-  // 8 are handled by repeating that pair, not by widening it -- six
-  // accumulators plus an input already occupy seven of the eight Q registers,
-  // so a third group would spill and give back more than it saves.
+  // Eight, not four: this kernel carries TWO 4-frame groups through the tap
+  // loop. Larger blocks repeat that pair rather than widen it - a third group
+  // would need a ninth Q register and spill.
   static_assert(nf % 8 == 0, "fm2 processes whole pairs of 4-frame groups");
     #else
   const int nf = num_frames;
@@ -1338,11 +1268,8 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
 
   float* __restrict const lin = _layer_in.data();
   float* __restrict const hsum = _head_sum.data();
-  // __restrict is honest here -- the weight block is written once at load time
-  // and is read-only from the kernels. Measured as codegen-neutral on GCC 14.3
-  // (byte-identical output), so it is documentation and future-proofing, not a
-  // fix: it was tried as a candidate for the regression noted below and was not
-  // the cause.
+  // __restrict is honest: the weight block is written once at load time and is
+  // read-only from the kernels. Codegen-neutral on GCC 14.3 - documentation.
   const float* __restrict const cw = L.conv_w;
   const float* __restrict const lw = L.l1x1_w;
 
@@ -1363,13 +1290,10 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   float32x4_t z2a = vdupq_n_f32(L.conv_b[2]);
   float32x4_t z2b = z2a;
 
-  // Deepest tap first, then +D per tap: the same sequence tap_base(K-1-k)
-  // produces, without the per-tap multiply.
-  // With the ring sized exactly max_lookback + nf, the deepest tap base for
-  // frame 0 is (write_pos - nf - max_lookback) mod ring_size, and
-  // nf + max_lookback IS ring_size -- so it reduces to write_pos. Frame g0
-  // starts g0 further on, and one wrap is enough because write_pos < ring_size
-  // and g0 < nf <= ring_size.
+  // Deepest tap first, then +D per tap: the sequence tap_base(K-1-k) produces,
+  // without the per-tap multiply. With the ring sized exactly max_lookback + nf
+  // the deepest tap base reduces to write_pos, and one wrap suffices because
+  // write_pos < ring_size and g0 < nf <= ring_size.
   int b = wrap_fwd(L.write_pos + g0, rsz);
 
   for (int k = 0; k < K; k++)
@@ -1578,18 +1502,14 @@ void A2FastModel<Channels>::_head_ring_write_fm(int num_frames)
 // -----------------------------------------------------------------------------
 // Frame-major Helium head.
 //
-// The head is a K=16, dilation-1 conv from Channels to 1. Scalar and
-// column-major it was 16 taps x 3 channels x 8 frames = 384 FMAs with a load
-// each -- the last unvectorised arithmetic in the block.
+// The head is a K=16, dilation-1 conv from Channels to 1: column-major and
+// scalar that is 384 FMAs with a load each, the last unvectorised arithmetic in
+// the block. Transposed, the columns one tap reads for four consecutive frames
+// are themselves consecutive, so each (tap, channel) is one vector load and one
+// vector-by-scalar FMA - 96 vector FMAs instead of 384 scalar ones, with the
+// accumulator resident across all 16 taps and no _head_sum transpose.
 //
-// Transposed, the columns a given tap reads for four consecutive frames are
-// themselves consecutive, so each (tap, channel) is one vector load and one
-// vector-by-scalar FMA: 96 vector FMAs in place of 384 scalar ones. The
-// accumulator stays in a Q register across all 16 taps, and the per-block
-// _head_sum transpose that the column-major layout forced disappears with it.
-//
-// Per lane the accumulation order matches the scalar head exactly -- seed with
-// _head_b, then tap 0 channels 0,1,2, tap 1 channels 0,1,2, ...
+// Per lane the accumulation order matches the scalar head exactly.
 // -----------------------------------------------------------------------------
 template <int Channels>
 void A2FastModel<Channels>::_head_forward_fm(float* output, int num_frames)
@@ -1688,11 +1608,10 @@ template <int Channels>
 void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int num_frames)
 {
   #if NAM_A2_FIXED_BLOCK > 0
-  // Every bound in the hot path below is compiled for exactly kFixedBlock
-  // frames, so a caller asking for a different count would read and write past
-  // them. Refuse the block instead: latch, and leave the output untouched.
-  // SetMaxBufferSize() rejects a mismatched size at Reset() time, so reaching
-  // here means the caller changed its block size mid-stream.
+  // Every bound in the hot path is compiled for exactly kFixedBlock frames, so
+  // another count would read and write past them. Latch and leave the output
+  // untouched. Reaching here means the caller changed block size mid-stream;
+  // SetMaxBufferSize() rejects a mismatch at Reset() time.
   if (num_frames != kFixedBlock)
   {
     NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: num_frames != NAM_A2_FIXED_BLOCK");
@@ -1765,12 +1684,10 @@ struct A2FastConfig : public ModelConfig
     else
       NAM_FAIL_RET(nam::Status::ErrorUnsupportedShape, "A2FastConfig: unsupported channel count", nullptr);
 
-    // The constructor loads weights and cannot report a bad stream by returning,
-    // so it latches instead. Check here, where there is somewhere to put the
-    // answer, and discard a model built from a stream that did not add up --
-    // otherwise it would run with zero-filled tail weights and sound wrong
-    // rather than fail. With exceptions enabled the constructor threw and this
-    // is never reached.
+    // The constructor cannot report a bad weight stream by returning, so it
+    // latches. Check here and discard the model: otherwise it runs with
+    // zero-filled tail weights and sounds wrong rather than failing. With
+    // exceptions enabled the constructor threw and this is never reached.
     if (!IsOk(GetLastError()))
       return nullptr;
 
@@ -1839,13 +1756,11 @@ bool is_a2_shape(const nlohmann::json& config, int* channels)
   if (head_it != config.end() && !head_it->is_null())
     return false;
 
-  // No conditioning DSP. When given a non-null condition_dsp the generic WaveNet
-  // builds a nested model and routes the conditioning signal through it before the
-  // layer stack; the fast path has no such stage and feeds the raw input as the
-  // condition. The condition DSP carries its own weights, so the parent weight
-  // stream is identical with or without it and the loader cannot detect the
-  // difference -- the detector must reject it here, or the fast path would silently
-  // produce different audio than the model it replaces.
+  // No conditioning DSP. The generic WaveNet routes the condition through a
+  // nested model; the fast path has no such stage and feeds the raw input. The
+  // condition DSP carries its own weights, so the parent stream is identical
+  // either way and only the detector can reject it - miss this and the fast
+  // path silently produces different audio.
   auto cond_it = config.find("condition_dsp");
   if (cond_it != config.end() && !cond_it->is_null())
     return false;
@@ -1991,19 +1906,15 @@ bool is_a2_shape(const WaveNetConfig& config, int* channels)
   if (config.with_head || config.head_params.has_value())
     return false;
 
-  // No conditioning DSP. Same reasoning as the JSON overload, and it matters more
-  // here: the condition DSP carries its own weights, so the parent weight stream is
-  // byte-identical with or without it. A binary loader cannot detect the difference
-  // from the weight blob, and the fast path has no conditioning stage -- it feeds
-  // the raw input as the condition. Missing this check does not fail loudly; it
-  // silently produces different audio than the model it replaces.
+  // No conditioning DSP. Same reasoning as the JSON overload, and it matters
+  // more here: a binary loader has only the weight blob, which is byte-identical
+  // with or without the condition DSP. Missing this does not fail loudly.
   if (config.condition_dsp != nullptr)
     return false;
 
-  // head_scale is not checked. The JSON overload requires the field only to keep
-  // the document schema-compatible with the generic parser; the value itself is
-  // always overwritten from the trailing weight, by the generic path and the fast
-  // path alike, so there is nothing here that could differ.
+  // head_scale is not checked. The JSON overload requires the field only for
+  // schema compatibility; the value is always overwritten from the trailing
+  // weight, by both paths alike.
 
   if (config.in_channels != 1)
     return false;
@@ -2045,11 +1956,9 @@ bool is_a2_shape(const WaveNetConfig& config, int* channels)
       return false;
   }
 
-  // No gating anywhere. This subsumes the JSON overload's separate checks on the
-  // legacy `gated` boolean and on secondary_activation: the parser folds `gated`
-  // into gating_modes, and Layer only ever reads secondary_activation_config when
-  // the mode is GATED or BLENDED (detail.h), so under all-NONE gating a secondary
-  // activation cannot affect the model's output.
+  // No gating anywhere. Subsumes the JSON overload's separate checks on `gated`
+  // and secondary_activation: the parser folds `gated` into gating_modes, and
+  // Layer reads secondary_activation_config only under GATED or BLENDED.
   if (la.gating_modes.size() != static_cast<size_t>(kNumLayers))
     return false;
   for (const auto& gm : la.gating_modes)

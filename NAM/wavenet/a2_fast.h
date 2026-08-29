@@ -7,10 +7,6 @@
 // When NAM_ENABLE_A2_FAST is defined at build time, wavenet::create_config
 // consults is_a2_shape() on every incoming WaveNet config and, on match,
 // instantiates an A2FastModel<Channels> instead of the generic WaveNet.
-//
-// The baseline here is correct-but-unoptimized (plain column-major loops).
-// Follow-up optimizations (unrolled GEMV, tap-major nest, factored
-// per-kernel-size helpers) plug into the same class.
 
 #if defined(NAM_ENABLE_A2_FAST)
 
@@ -51,15 +47,11 @@ bool is_a2_shape(const nlohmann::json& config, int* channels);
 
 /// \brief Strict detector operating on an already-parsed WaveNetConfig.
 ///
-/// The JSON overload above can only serve loaders that have a JSON document.
 /// A binary loader (.namb) builds a WaveNetConfig directly and hands it to
-/// create_dsp(), which does no shape checking -- so without this overload an
-/// A2 model loaded from .namb silently runs the generic WaveNet.
-///
-/// This inspects the typed parameters the model will actually be built from,
-/// rather than re-deriving the JSON predicates in binary terms. That keeps the
-/// two entry points from drifting: a field the binary format gains later cannot
-/// bypass the check, because the check reads the constructed config.
+/// create_dsp(), which does no shape checking, so without this overload an A2
+/// model from .namb silently runs the generic WaveNet. Inspecting the
+/// constructed config rather than re-deriving the JSON predicates keeps the two
+/// entry points from drifting as the binary format gains fields.
 ///
 /// \param config   Parsed WaveNet configuration.
 /// \param channels Out-param set to 3 (A2-Lite) or 8 (A2-Full) on match.
@@ -113,14 +105,13 @@ Kernel GetPendingKernel();
 
 /// \brief Floats in one model's weight block, for a given channel count.
 ///
-/// Every weight the model owns lives in one contiguous block: the rechannel
-/// vector, then per layer the dilated conv kernel, its bias, the input mixin
-/// and the 1x1 with its bias, then the head kernel. (head_bias and head_scale
-/// are two scalars and stay in the object.)
+/// Every weight lives in one contiguous block: the rechannel vector, then per
+/// layer the dilated conv kernel, its bias, the input mixin and the 1x1 with
+/// its bias, then the head kernel. head_bias and head_scale stay in the object.
 ///
-/// This is a compile-time constant because is_a2_shape() admits exactly one
-/// geometry -- captures differ in weight *values*, never in shape. A host can
-/// therefore size a pool with a static_assert rather than a guess.
+/// Constant at compile time because is_a2_shape() admits exactly one geometry -
+/// captures differ in weight values, never in shape - so a host can size a pool
+/// with a static_assert rather than a guess.
 constexpr int weight_block_floats(int channels)
 {
   int n = channels; // rechannel
@@ -139,12 +130,9 @@ constexpr int weight_block_floats(int channels)
 /// \brief Somewhere other than the heap to put model weights.
 ///
 /// The weights are ~8% of a model's bytes but roughly 30% of its per-block
-/// memory traffic -- every tap reads nine of them, 156 times a block, while
-/// ~79K of ring history streams past and evicts them. That density is what
-/// makes them worth pinning in fast memory when the histories cannot be.
-///
-/// One alloc and one release per model, so a fixed-slot pool is a sufficient
-/// implementation; there is no fragmentation to manage.
+/// memory traffic, which makes them worth pinning in fast memory when the ring
+/// histories cannot be. One alloc and one release per model, so a fixed-slot
+/// pool is a sufficient implementation.
 struct WeightArena
 {
   /// Allocate `bytes`, aligned to at least 16. Return nullptr when full --

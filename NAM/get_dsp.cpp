@@ -14,16 +14,12 @@ namespace nam
 namespace
 {
 
-// Equivalent of the regex ^\d+\.\d+\.\d+$ : exactly three non-empty runs of
-// ASCII digits, separated by single dots, with nothing else in the string. No
-// sign, no whitespace, no fourth component, no trailing dot. Leading zeros are
-// accepted, as they were by the regex.
+// Equivalent of ^\d+\.\d+\.\d+$ : exactly three non-empty runs of ASCII digits
+// separated by single dots, nothing else. Leading zeros accepted, as the regex
+// accepted them.
 //
-// Hand-rolled rather than std::regex because this was the library's only regex,
-// and <regex> is one of the most code-hungry headers in the standard library --
-// on a bare-metal target it costs more flash than the model it is guarding. The
-// check runs once per model load, so there is nothing to gain from a compiled
-// pattern either.
+// Hand-rolled because this was the library's only regex, and <regex> costs more
+// flash on a bare-metal target than the model it guards.
 bool is_semver_triple(const std::string& s)
 {
   size_t i = 0;

@@ -1,12 +1,9 @@
 #pragma once
-// Read-side view of a model pack sitting in memory-mapped flash.
-//
-// The pack is never copied out of flash: get_dsp_namb() takes a pointer and a
-// length, so a model is parsed straight through the XSPI window. This header
-// turns the raw bytes at FLASH_BASE into validated Entry records and hands back
-// pointers into that same window.
-//
-// Header-only and allocation-free, so it can be used before the heap is warm.
+// Read-side view of a model pack sitting in memory-mapped flash. Turns the raw
+// bytes at FLASH_BASE into validated Entry records and hands back pointers into
+// that same window; nothing is copied out, since get_dsp_namb() parses through
+// a pointer and a length. Header-only and allocation-free, so it works before
+// the heap is warm.
 //
 //   nam::nambpack::PackView pack;
 //   if (nam::IsOk(pack.Open()))
@@ -16,10 +13,9 @@
 //       auto model = nam::get_dsp_namb(pack.Blob(*e), e->size, st);
 //   }
 //
-// Everything read here is flash contents, which may be erased (all 0xFF), stale
-// from an older layout, or half-programmed. Every field is therefore range
-// checked before use -- a bad offset would otherwise be dereferenced straight
-// into a fault.
+// Flash contents may be erased (all 0xFF), stale from an older layout, or
+// half-programmed, so every field is range checked before use: a bad offset
+// would otherwise be dereferenced straight into a fault.
 
 #include <cstdint>
 #include <cstring>

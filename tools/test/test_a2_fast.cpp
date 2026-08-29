@@ -458,15 +458,14 @@ void test_process_realtime_safe_full()
 // =============================================================================
 // Typed detector: is_a2_shape(const WaveNetConfig&, int*)
 //
-// The JSON overload can only serve loaders that have a JSON document.
-// wavenet::create_config() consults it, but create_dsp() does not -- so a loader
-// that builds a WaveNetConfig directly (the .namb binary loader) reaches the
-// generic WaveNet no matter what shape the model is. These cover the typed
-// overload that closes that gap.
+// create_config() consults the JSON overload but create_dsp() does not, so a
+// loader that builds a WaveNetConfig directly - the .namb loader - reaches the
+// generic WaveNet whatever shape the model is. These cover the typed overload
+// that closes that gap.
 //
-// The parity test is the one that matters long-term: it pins the two detectors
-// to the same verdict, so a predicate added to one and not the other fails here
-// rather than silently changing which class a .namb model gets.
+// The parity test matters most: it pins the two detectors to the same verdict,
+// so a predicate added to one and not the other fails here rather than silently
+// changing which class a .namb model gets.
 // =============================================================================
 
 namespace
@@ -651,21 +650,18 @@ void test_typed_detector_agrees_with_json()
 // The one config the two detectors legitimately disagree on, pinned here so the
 // divergence is a documented property rather than a surprise.
 //
-// A layer carrying BOTH gating_mode (all "none") and the legacy gated=true is
-// self-contradictory. parse_config_json resolves it by precedence: when
-// gating_mode is present the legacy boolean is never read (model.cpp), so the
-// parsed model has no gating and the fast path is a valid substitution for it.
+// A layer carrying both gating_mode (all "none") and the legacy gated=true is
+// self-contradictory. parse_config_json resolves it by precedence - gating_mode
+// present means the boolean is never read - so the parsed model has no gating
+// and the fast path substitutes for it validly.
 //
-//   JSON detector  rejects  - it tests gated unconditionally, without modelling
-//                             the precedence rule. Conservative: a missed
-//                             optimisation, never wrong audio.
+//   JSON detector  rejects  - tests gated unconditionally, without the
+//                             precedence rule. A missed optimisation only.
 //   Typed detector accepts  - correct about what the model actually does.
 //
-// The typed overload cannot reproduce the JSON verdict even if we wanted it to:
-// `gated` does not survive parsing, so by the time a WaveNetConfig exists the
-// field is gone. This is the direction that is safe to differ in -- the reverse
-// (typed accepting something whose fast path would sound different) is what
-// test_typed_detector_rejects_condition_dsp guards.
+// The typed overload could not reproduce the JSON verdict anyway: `gated` does
+// not survive parsing. This is the safe direction to differ in; the reverse is
+// what test_typed_detector_rejects_condition_dsp guards.
 void test_typed_detector_diverges_on_contradictory_gating()
 {
   auto j = build_a2_config(3);

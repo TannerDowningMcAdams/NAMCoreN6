@@ -62,17 +62,13 @@ const char* ToString(Status status);
 // Failure latch
 //
 // Most of the library's validation lives in constructors, which have no return
-// value to carry a status. Rather than restructure every one into a two-phase
-// init, a failure records itself here and the loader checks once after
-// construction -- so a fault still propagates to the caller, just not through
-// the signatures.
+// value to carry a status. Rather than restructure each into a two-phase init,
+// a failure records itself here and the loader checks once after construction.
+// Clear before a load, check after.
 //
-// First failure wins: later calls do not overwrite an already-latched status,
-// so the reported cause is the root one rather than whatever failed last as a
-// consequence. Clear before a load, check after.
-//
-// Not thread-safe by design. Model loading happens on one thread; making this
-// atomic would cost every embedded target for a case that does not arise.
+// First failure wins, so the reported cause is the root one rather than
+// whatever failed last as a consequence. Not thread-safe by design - model
+// loading happens on one thread.
 // ============================================================================
 
 /// \brief Latch a failure, if none is latched already.
@@ -109,15 +105,11 @@ namespace detail
 {
 /// \brief Sink that swallows everything streamed into it.
 ///
-/// Diagnostic messages are built with std::stringstream and then discarded by
-/// NAM_FAIL in this build. Merely *constructing* one costs far more than the
-/// message is worth: std::stringstream drags in the libstdc++ locale
-/// machinery, which reaches std::__timepunct -> wcsftime -> swprintf, and
-/// newlib-nano does not define swprintf. The link fails on a message nobody
-/// reads.
-///
-/// NAM_DIAG_STREAM declares one of these instead, so the formatting code still
-/// compiles but generates nothing.
+/// NAM_FAIL discards diagnostic messages in this build, but merely constructing
+/// the std::stringstream that formats one drags in the libstdc++ locale
+/// machinery, which reaches swprintf - undefined in newlib-nano. The link then
+/// fails over a message nobody reads. NAM_DIAG_STREAM declares one of these
+/// instead, so the formatting code compiles and generates nothing.
 struct NullStream
 {
   template <typename T>

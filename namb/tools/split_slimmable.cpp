@@ -121,10 +121,9 @@ int main(int argc, char* argv[])
     if (outerMeta.is_object())
     {
       json merged = outerMeta;
-      // Submodel's own metadata wins on conflict -- its loudness/gain are the
-      // ones that belong to these weights. Bind the submodel metadata to a named
-      // object first: value() returns a temporary, so begin()/end() taken from
-      // two separate calls would be iterators into two different objects.
+      // Submodel metadata wins on conflict - its loudness/gain belong to these
+      // weights. Bound to a named object first because value() returns a
+      // temporary, so begin() and end() would come from different objects.
       const json innerMeta = model.value("metadata", json::object());
       for (auto it = innerMeta.begin(); it != innerMeta.end(); ++it)
         merged[it.key()] = it.value();

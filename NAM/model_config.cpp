@@ -1,14 +1,11 @@
 // Construction path shared by every loader.
 //
-// create_dsp() is declared in model_config.h but used to live in get_dsp.cpp,
-// which also carries the JSON file readers, a mutex-guarded version-support
-// registry and <iostream>. A binary loader (.namb) needs these four lines and
-// none of that, so they live here instead -- an embedded target can compile
-// this translation unit without pulling the JSON path in behind it.
+// create_dsp() lives here rather than in get_dsp.cpp so an embedded target can
+// compile it without dragging in that file's JSON readers, mutex-guarded
+// version registry and <iostream>. A .namb loader needs these four lines alone.
 //
-// dsp.h is included explicitly: model_config.h only forward-declares DSP (to
-// stay free of a circular include), which is enough to pass a unique_ptr<DSP>
-// around but not to call member functions on one.
+// dsp.h is included explicitly: model_config.h only forward-declares DSP, which
+// is enough to pass a unique_ptr<DSP> around but not to call members on one.
 
 #include "model_config.h"
 

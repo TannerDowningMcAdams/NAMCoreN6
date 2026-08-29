@@ -2,10 +2,9 @@
 // Model pack (.nambpack): a table of contents plus N .namb blobs, programmed to
 // external flash as one image and read in place.
 //
-// The firmware never copies a model out of flash to parse it -- get_dsp_namb()
-// takes a pointer and a length, so the whole pack is read through the
-// memory-mapped XSPI window. This header defines the layout for both the packing
-// tool and the firmware that reads it, so the two cannot drift.
+// Shared by the packing tool and the firmware so the two cannot drift. The
+// firmware never copies a model out of flash: the whole pack is read through
+// the memory-mapped XSPI window.
 //
 // Flash map (STM32N6 / W25Q, XSPI1 memory-mapped at 0x90000000):
 //

@@ -39,10 +39,8 @@ std::unique_ptr<DSP> get_dsp_namb(const uint8_t* data, size_t size);
 
 /// \brief Load a NAM model from a .namb file.
 ///
-/// Not available when NAM_NO_EXCEPTIONS is defined: it exists to read a file
-/// and report failure by throwing, and an embedded target has neither
-/// std::filesystem nor a reason to go through one -- the buffer overload above
-/// takes a pointer into mapped flash directly.
+/// Not available under NAM_NO_EXCEPTIONS: an embedded target has no
+/// std::filesystem, and the buffer overload takes a pointer into mapped flash.
 ///
 /// \throws std::runtime_error on any failure.
 std::unique_ptr<DSP> get_dsp_namb(const std::filesystem::path& filename);

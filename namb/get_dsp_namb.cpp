@@ -10,14 +10,10 @@
 
 // NAMB_WAVENET_ONLY trims this loader to the WaveNet architecture.
 //
-// Each architecture is pulled into the link by its registration below, not by
-// anything referencing it: registering Linear, LSTM and ConvNet is what drags
-// linear.cpp, lstm.cpp and convnet.cpp in. A target that only ever loads
-// WaveNet models -- an A2 pedal, say -- pays for three architectures it can
-// never be handed. Defining this drops them, and a .namb carrying one of those
-// architecture IDs then fails cleanly in the registry ("unknown architecture
-// ID") rather than silently mis-loading.
-//
+// An architecture is pulled into the link by its registration below, not by
+// anything referencing it, so a target that only loads WaveNet models still
+// pays for Linear, LSTM and ConvNet. Defining this drops them; a .namb carrying
+// one of those IDs then fails cleanly in the registry rather than mis-loading.
 // Undefined by default, so desktop and test builds keep every architecture.
 
 #include <NAM/activations.h>
@@ -153,16 +149,12 @@ ParsedMetadata read_metadata_block(BinaryReader& r)
   return m;
 }
 
-// Model config version check, done on the integers the header already carries.
-//
-// nam::verify_config_version() takes a string, and getting one means composing
-// major/minor/patch with std::to_string only for it to be parsed straight back.
-// That round trip also drags in the whole support-checker path -- a registry
-// behind a std::mutex, shared_ptr, stringstream -- for what is a comparison of
-// three small integers. On a target built without exceptions and counting
-// flash, none of that is worth having.
-//
-// Bounds come from get_dsp.h so the two checks cannot describe different ranges.
+// Version check on the integers the header already carries.
+// nam::verify_config_version() takes a string, so using it means composing one
+// only for it to be parsed straight back, and dragging in the support-checker
+// path - a registry behind a std::mutex, shared_ptr, stringstream - to compare
+// three small integers. Bounds come from get_dsp.h so the two checks cannot
+// describe different ranges.
 bool is_model_version_supported(int major, int minor, int patch)
 {
   // Below the earliest supported version?
@@ -417,18 +409,12 @@ std::unique_ptr<nam::ModelConfig> load_wavenet(BinaryReader& r, const float*& we
   wc->head_scale = 0.0f;
 
 #if defined(NAM_ENABLE_A2_FAST)
-  // The JSON entry point (wavenet::create_config) consults is_a2_shape() on every
-  // incoming config; create_dsp() does not, so a binary loader that returns a
-  // WaveNetConfig gets the generic WaveNet no matter what shape it is. Run the
-  // same detector here, against the typed config we just built, so .namb reaches
-  // the fast path on exactly the models .nam does.
+  // create_dsp() does no shape check, so run the same detector the JSON entry
+  // point runs and .namb reaches the fast path on exactly the models .nam does.
   //
-  // Note this must run on the fully-populated wc -- in particular after
-  // condition_dsp has been attached above. The detector rejects a non-null
-  // condition_dsp, and it has to: the condition DSP carries its own weights, so
-  // the parent weight stream is byte-identical with or without one and nothing
-  // downstream could catch the substitution. Checking earlier would see a null
-  // pointer and wrongly admit the model.
+  // Must run on the fully-populated wc, after condition_dsp is attached: the
+  // detector has to reject a non-null condition_dsp, and checking earlier would
+  // see a null pointer and wrongly admit the model.
   int a2_channels = 0;
   if (nam::wavenet::a2_fast::is_a2_shape(*wc, &a2_channels))
   {
