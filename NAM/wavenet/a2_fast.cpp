@@ -32,6 +32,12 @@
     #define NAM_A2_PROFILE 0
   #endif
 
+  // Ring sizing a model adopts unless SetRingPolicyForNextModel() says
+  // otherwise. See RingPolicy in the header for what the two cost.
+  #ifndef NAM_A2_RING_POLICY_DEFAULT
+    #define NAM_A2_RING_POLICY_DEFAULT 0
+  #endif
+
   // Compile-time default per-layer kernel; values match a2_fast.h's Kernel.
   // NAM_A2_BENCH lets the host override it per model through
   // SetKernelForNextModel(), which is how the two are compared on target.
@@ -107,6 +113,10 @@ namespace
 /// public SetKernelForNextModel(); read once, in the constructor. Not
 /// thread-safe and not meant to be -- models are built during setup.
 int g_pending_kernel = NAM_A2_KERNEL_DEFAULT;
+
+/// Ring sizing the next A2FastModel construction will adopt. Same contract as
+/// g_pending_kernel: set through the public API, read once in the constructor.
+int g_pending_ring_policy = NAM_A2_RING_POLICY_DEFAULT;
 
 /// Arena the next A2FastModel construction will take its weight block from.
 /// Null means the heap. Read once, in the constructor, and captured there.
@@ -186,6 +196,10 @@ private:
     // cols; write_pos stays in [0, ring_size) and reads are contiguous because
     // the tail cols mirror cols [0, max_buffer_size).
     int ring_size = 0;
+    // Where the kernels start reading this block, maintained by the ring write
+    // rather than recomputed per tap. Derived from write_pos, so it is
+    // refreshed wherever write_pos is; see read_base_of().
+    int read_base = 0;
     int write_pos = 0;
   #else
     // Linear ring with sporadic memmove-rewind. history_cols = 2*max_lookback +
@@ -255,6 +269,7 @@ private:
   /// Fixed at construction: the history layout depends on it, so it cannot
   /// change once buffers are sized and warmed.
   int _kernel = NAM_A2_KERNEL_DEFAULT;
+  int _ring_policy = NAM_A2_RING_POLICY_DEFAULT;
   bool _frame_major() const { return _kernel == 1 || _kernel == 2; }
 
   #if NAM_A2_HAVE_MVE
@@ -284,6 +299,10 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
   // Latch the kernel choice for this instance now: the history layout follows
   // from it, so it must be settled before SetMaxBufferSize() sizes anything.
   _kernel = g_pending_kernel;
+
+  // Latched for the same reason as the kernel: SetMaxBufferSize() sizes the
+  // rings from it and nothing may change afterwards.
+  _ring_policy = g_pending_ring_policy;
   #if !NAM_A2_HAVE_MVE
   _kernel = 0; // no Helium float on this target
   #endif
@@ -506,6 +525,21 @@ inline int wrap_back(int v, int size)
   return (v < 0) ? (v + size) : v;
 }
 
+/// Physical index of frame 0 of the block the kernels are about to read: the
+/// deepest tap's base.
+///
+/// This used to be spelled `write_pos` at the one site that needed it, correct
+/// only while ring_size was exactly max_lookback + block - the subtraction then
+/// wrapped by one whole ring and cancelled. Under RingPolicy::BlockAligned the
+/// ring carries up to a block of slack, the cancellation is wrong by that
+/// slack, and the kernel reads real frames from the wrong offset. Every index
+/// stays in range, so it does not fault or assert; it measured as a 0.185
+/// output error against a reference that should have matched to 6e-8.
+inline int read_base_of(int write_pos, int block, int lookback, int ring)
+{
+  return wrap_back(write_pos - block - lookback, ring);
+}
+
 // Fixed-length non-overlapping float copy. Not std::memcpy: even at a constant
 // length GCC declines to expand a 96-byte copy inline here and calls newlib,
 // which the ring writes would do ~48 times a block. A constant-trip float loop
@@ -574,14 +608,17 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
     // Exactly max_lookback + one block, no rounding: the read window is then
     // precisely the whole ring, with the deepest tap sitting where the NEXT
     // block writes. Rounding up to a power of two to make the wrap a mask costs
-    // 40% (131.4K vs 78.9K per model), which is the difference between two
-    // model instances fitting in DTCM and not.
-    L.ring_size = L.max_lookback + maxBufferSize;
+    // 40% (131.4K vs 78.9K per model); it lost on cycles with histories in DTCM
+    // and again after they moved to RAM_HEAP, so it is not an option here.
+    // BlockAligned is the other 1.3%, and is a different trade - see RingPolicy.
+    const RingPolicy policy = static_cast<RingPolicy>(_ring_policy);
+    L.ring_size = ring_frames(policy, L.max_lookback, maxBufferSize);
+    L.write_pos = ring_start(policy, L.max_lookback, maxBufferSize);
+    L.read_base = read_base_of(L.write_pos, maxBufferSize, L.max_lookback, L.ring_size);
     L.history.assign(static_cast<size_t>(Channels) * (L.ring_size + maxBufferSize), 0.0f);
     // Frame-major reads row c at [c * row_stride]; the reference kernel ignores
     // this. Same allocation, different interpretation.
     L.row_stride = L.ring_size + maxBufferSize;
-    L.write_pos = L.max_lookback;
   #else
     L.history_cols = 2 * L.max_lookback + maxBufferSize;
     L.history.assign(static_cast<size_t>(Channels) * L.history_cols, 0.0f);
@@ -591,10 +628,13 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
   const int head_lookback = kHeadKernelSize - 1;
   #if NAM_A2_RING_MODE == 1
-  _head_ring_size = head_lookback + maxBufferSize;
+  // The head's ring is the shortest in the model - lookback 15 against a block
+  // of 8 - so under Exact it straddles more than one block in three, more often
+  // than any single layer. Same policy, for the same reason.
+  _head_ring_size = ring_frames(static_cast<RingPolicy>(_ring_policy), head_lookback, maxBufferSize);
+  _head_write_pos = ring_start(static_cast<RingPolicy>(_ring_policy), head_lookback, maxBufferSize);
   _head_history.assign(static_cast<size_t>(Channels) * (_head_ring_size + maxBufferSize), 0.0f);
   _head_row_stride = _head_ring_size + maxBufferSize;
-  _head_write_pos = head_lookback;
   #else
   _head_history_cols = 2 * head_lookback + maxBufferSize;
   _head_history.assign(static_cast<size_t>(Channels) * _head_history_cols, 0.0f);
@@ -647,7 +687,12 @@ void A2FastModel<Channels>::PrewarmFromCache()
                   L.history.begin() + static_cast<std::ptrdiff_t>(column * Channels));
       }
     }
+  #if NAM_A2_RING_MODE == 1
+    L.write_pos = ring_start(static_cast<RingPolicy>(_ring_policy), L.max_lookback, GetMaxBufferSize());
+    L.read_base = read_base_of(L.write_pos, GetMaxBufferSize(), L.max_lookback, L.ring_size);
+  #else
     L.write_pos = L.max_lookback;
+  #endif
   }
 
   if (_frame_major())
@@ -668,7 +713,11 @@ void A2FastModel<Channels>::PrewarmFromCache()
                 _head_history.begin() + static_cast<std::ptrdiff_t>(column * Channels));
     }
   }
+  #if NAM_A2_RING_MODE == 1
+  _head_write_pos = ring_start(static_cast<RingPolicy>(_ring_policy), kHeadKernelSize - 1, GetMaxBufferSize());
+  #else
   _head_write_pos = kHeadKernelSize - 1;
+  #endif
 }
 
 template <int Channels>
@@ -763,6 +812,7 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
     copy_block<Channels>(hist + static_cast<size_t>(L.ring_size) * Channels, hist, mbs);
   }
   L.write_pos = wrap_fwd(wp + nf, L.ring_size);
+  L.read_base = read_base_of(L.write_pos, nf, L.max_lookback, L.ring_size);
   #else
   if (L.write_pos + nf > L.history_cols)
   {
@@ -833,6 +883,7 @@ void A2FastModel<Channels>::_ring_write_fm(Layer& L, int num_frames)
   }
 
   L.write_pos = wrap_fwd(wp + nf, L.ring_size);
+  L.read_base = read_base_of(L.write_pos, nf, L.max_lookback, L.ring_size);
 }
   #endif // NAM_A2_HAVE_MVE
 
@@ -1324,8 +1375,18 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   // without the per-tap multiply. With the ring sized exactly max_lookback + nf
   // the deepest tap base reduces to write_pos, and one wrap suffices because
   // write_pos < ring_size and g0 < nf <= ring_size. Runs K-1 times: the newest
-  // tap is peeled out below.
-  int b = wrap_fwd(L.write_pos + g0, rsz);
+   // Deepest tap first, then +D per tap: the sequence tap_base(K-1-k) produces,
+  // without the per-tap multiply.
+  //
+  // read_base is (write_pos - nf - max_lookback) mod ring_size, computed once
+  // per block by the ring write. This was spelled `write_pos` directly, which
+  // is the same value only while ring_size is exactly max_lookback + nf - true
+  // under RingPolicy::Exact and false under BlockAligned, where the ring
+  // carries slack and the shortcut reads the wrong frames. Same instruction
+  // count either way, so the general form buys correctness for nothing. Frame
+  // g0 starts g0 further on, and one wrap is enough because read_base <
+  // ring_size and g0 < nf <= ring_size.
+  int b = wrap_fwd(L.read_base + g0, rsz);
 
   for (int k = 0; k < K - 1; k++)
   {
@@ -2088,6 +2149,16 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(int channels)
   auto out = std::make_unique<A2FastConfig>();
   out->channels = channels;
   return out;
+}
+
+void SetRingPolicyForNextModel(RingPolicy p)
+{
+  g_pending_ring_policy = static_cast<int>(p);
+}
+
+RingPolicy GetPendingRingPolicy()
+{
+  return static_cast<RingPolicy>(g_pending_ring_policy);
 }
 
 void SetKernelForNextModel(Kernel k)
