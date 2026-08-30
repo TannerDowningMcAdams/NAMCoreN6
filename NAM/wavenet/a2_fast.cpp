@@ -126,6 +126,11 @@ const WeightArena* g_weight_arena = nullptr;
 /// histories to. Null means every history stays in the model's own memory.
 const HistoryStreamer* g_history_streamer = nullptr;
 
+/// What the last construction actually settled on, after the downgrades. Read
+/// through GetLastModelKernel() and GetLastModelStreamedLayers().
+int g_last_kernel = 0;
+int g_last_streamed = 0;
+
 // =============================================================================
 // A2FastModel<Channels>
 //
@@ -356,6 +361,9 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     // keeps the Eigen path, which already blocks over whole frames.
     _kernel = 0;
   }
+
+  // After the downgrades, so this is what will actually run.
+  g_last_kernel = _kernel;
 
   // One block for every weight, from the arena when one is set. Falling back
   // to the heap rather than failing keeps a full pool from turning into a
@@ -676,7 +684,10 @@ bool A2FastModel<Channels>::_house_streamed(Layer& L, int layer_idx, int maxBuff
 
   L.slot = _streamer->bind(g, _model_token, _streamer->ctx);
   if (L.slot != nullptr)
+  {
     _streamed[_streamed_count++] = layer_idx;
+    g_last_streamed = _streamed_count;
+  }
   return true;
 }
 
@@ -724,6 +735,7 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
   // Re-sizing rebinds: geometry the host was told about is now stale.
   _release_streaming();
+  g_last_streamed = 0;
 
   // Only frame-major kernels read through Layer::rows, so only they can be
   // handed a host ring. The reference path keeps every history in `history`.
@@ -2535,6 +2547,16 @@ void SetHistoryStreamer(const HistoryStreamer* streamer)
 void SetWeightArena(const WeightArena* arena)
 {
   g_weight_arena = arena;
+}
+
+Kernel GetLastModelKernel()
+{
+  return static_cast<Kernel>(g_last_kernel);
+}
+
+int GetLastModelStreamedLayers()
+{
+  return g_last_streamed;
 }
 
 Kernel GetPendingKernel()

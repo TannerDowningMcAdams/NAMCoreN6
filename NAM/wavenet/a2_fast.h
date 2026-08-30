@@ -176,6 +176,22 @@ void SetKernelForNextModel(Kernel k);
 /// adopted -- see the downgrade note above.
 Kernel GetPendingKernel();
 
+/// \brief Kernel the most recently constructed model actually adopted, after
+/// every downgrade has been applied.
+///
+/// The requested kernel and the adopted one differ silently, which is the one
+/// failure this API cannot report by returning: a downgraded model builds,
+/// runs, and produces correct output, just slowly and bit-identically to the
+/// reference. A harness that records the request rather than this cannot tell
+/// a working variant from a downgraded one - identical error against the
+/// reference is what a downgrade looks like.
+Kernel GetLastModelKernel();
+
+/// \brief Layers of the most recently constructed model whose histories the
+/// installed HistoryStreamer accepted. Zero when none was installed, when it
+/// declined the model, or when the kernel is not frame-major.
+int GetLastModelStreamedLayers();
+
 /// \brief Floats in one model's weight block, for a given channel count.
 ///
 /// Every weight lives in one contiguous block: the rechannel vector, then per
