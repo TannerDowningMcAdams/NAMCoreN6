@@ -112,6 +112,10 @@ int g_pending_kernel = NAM_A2_KERNEL_DEFAULT;
 /// Null means the heap. Read once, in the constructor, and captured there.
 const WeightArena* g_weight_arena = nullptr;
 
+/// Streamer the next A2FastModel construction will offer its deep-dilation
+/// histories to. Null means every history stays in the model's own memory.
+const HistoryStreamer* g_history_streamer = nullptr;
+
 // =============================================================================
 // A2FastModel<Channels>
 //
@@ -1113,6 +1117,14 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
 // on-target harness checks that.
 //
 // nf is a multiple of 4 (asserted below), processed as nf/4 vector groups.
+//
+// The newest tap (taps_back == 0) is peeled out of the loop and read from
+// _layer_in instead of the ring. _ring_write_fm copied _layer_in into the ring
+// at write_pos immediately before this call, so tap_base(0) addresses those
+// exact floats: same bits, same accumulation order, one fewer history row to
+// address. The peel also leaves every remaining tap at least D frames old,
+// which is what lets a history live somewhere that has to be fetched ahead of
+// time -- nothing in the block depends on this block's own ring write.
 // -----------------------------------------------------------------------------
 template <int Channels>
 template <int KernelSize>
@@ -1142,6 +1154,7 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
 
   // Physical frame index of this block's first frame, taps_back*D in the past.
   // The tail mirror guarantees [base, base + nf) is contiguous within a row.
+  // Only taps_back >= 1 is ever asked for: see the newest-tap peel below.
   auto tap_base = [&](int taps_back) { return wrap_back(L.write_pos - nf - taps_back * D, rsz); };
 
   float* __restrict const lin = _layer_in.data();
@@ -1160,7 +1173,7 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
     float32x4_t z1 = vdupq_n_f32(L.conv_b[1]);
     float32x4_t z2 = vdupq_n_f32(L.conv_b[2]);
 
-    for (int k = 0; k < K; k++)
+    for (int k = 0; k < K - 1; k++)
     {
       const float* w = cw + static_cast<size_t>(k) * 9;
       const int b = tap_base(K - 1 - k) + g;
@@ -1170,6 +1183,23 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
 
       // w[j*3 + i] is input j -> output i, matching the reference kernel's
       // w0..w8 ordering exactly.
+      z0 = vfmaq_n_f32(z0, x0, w[0]);
+      z1 = vfmaq_n_f32(z1, x0, w[1]);
+      z2 = vfmaq_n_f32(z2, x0, w[2]);
+      z0 = vfmaq_n_f32(z0, x1, w[3]);
+      z1 = vfmaq_n_f32(z1, x1, w[4]);
+      z2 = vfmaq_n_f32(z2, x1, w[5]);
+      z0 = vfmaq_n_f32(z0, x2, w[6]);
+      z1 = vfmaq_n_f32(z1, x2, w[7]);
+      z2 = vfmaq_n_f32(z2, x2, w[8]);
+    }
+
+    // Newest tap, from _layer_in rather than the ring. See the note above.
+    {
+      const float* w = cw + static_cast<size_t>(K - 1) * 9;
+      const float32x4_t x0 = vld1q_f32(lin + g);
+      const float32x4_t x1 = vld1q_f32(lin + rs + g);
+      const float32x4_t x2 = vld1q_f32(lin + 2 * rs + g);
       z0 = vfmaq_n_f32(z0, x0, w[0]);
       z1 = vfmaq_n_f32(z1, x0, w[1]);
       z2 = vfmaq_n_f32(z2, x0, w[2]);
@@ -1293,10 +1323,11 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   // Deepest tap first, then +D per tap: the sequence tap_base(K-1-k) produces,
   // without the per-tap multiply. With the ring sized exactly max_lookback + nf
   // the deepest tap base reduces to write_pos, and one wrap suffices because
-  // write_pos < ring_size and g0 < nf <= ring_size.
+  // write_pos < ring_size and g0 < nf <= ring_size. Runs K-1 times: the newest
+  // tap is peeled out below.
   int b = wrap_fwd(L.write_pos + g0, rsz);
 
-  for (int k = 0; k < K; k++)
+  for (int k = 0; k < K - 1; k++)
   {
     const float* w = cw + static_cast<size_t>(k) * 9;
 
@@ -1332,6 +1363,37 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
     z2b = vfmaq_n_f32(z2b, x, w[8]);
 
     b = wrap_fwd(b + D, rsz);
+  }
+
+  // Newest tap, from _layer_in rather than the ring. See the note above.
+  {
+    const float* w = cw + static_cast<size_t>(K - 1) * 9;
+    float32x4_t x = vld1q_f32(lg);
+    z0a = vfmaq_n_f32(z0a, x, w[0]);
+    z1a = vfmaq_n_f32(z1a, x, w[1]);
+    z2a = vfmaq_n_f32(z2a, x, w[2]);
+    x = vld1q_f32(lg + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[0]);
+    z1b = vfmaq_n_f32(z1b, x, w[1]);
+    z2b = vfmaq_n_f32(z2b, x, w[2]);
+
+    x = vld1q_f32(lg + rs);
+    z0a = vfmaq_n_f32(z0a, x, w[3]);
+    z1a = vfmaq_n_f32(z1a, x, w[4]);
+    z2a = vfmaq_n_f32(z2a, x, w[5]);
+    x = vld1q_f32(lg + rs + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[3]);
+    z1b = vfmaq_n_f32(z1b, x, w[4]);
+    z2b = vfmaq_n_f32(z2b, x, w[5]);
+
+    x = vld1q_f32(lg + 2 * rs);
+    z0a = vfmaq_n_f32(z0a, x, w[6]);
+    z1a = vfmaq_n_f32(z1a, x, w[7]);
+    z2a = vfmaq_n_f32(z2a, x, w[8]);
+    x = vld1q_f32(lg + 2 * rs + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[6]);
+    z1b = vfmaq_n_f32(z1b, x, w[7]);
+    z2b = vfmaq_n_f32(z2b, x, w[8]);
   }
 
   // Post-conv tail, identical to fm but for both groups.
@@ -2031,6 +2093,11 @@ std::unique_ptr<ModelConfig> create_a2_fast_config(int channels)
 void SetKernelForNextModel(Kernel k)
 {
   g_pending_kernel = static_cast<int>(k);
+}
+
+void SetHistoryStreamer(const HistoryStreamer* streamer)
+{
+  g_history_streamer = streamer;
 }
 
 void SetWeightArena(const WeightArena* arena)
