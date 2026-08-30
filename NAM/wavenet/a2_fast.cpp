@@ -189,8 +189,24 @@ private:
     // on one vector load. Same allocation either way, which is why
     // SetMaxBufferSize() needs no branch.
     std::vector<float> history;
-    int row_stride = 0; // frame-major only: ring_size + max_buffer_size
+    int row_stride = 0; // frame-major only: floats per channel row
     std::array<float, Channels> cached_prewarm_state{};
+
+    // Where the ring actually is. Into `history` for a model-owned ring, or at
+    // host memory for a streamed one. Every frame-major read and write goes
+    // through this; the reference path still uses `history` directly, which is
+    // safe because streaming is offered only to frame-major models.
+    float* rows = nullptr;
+    // Host-owned ring, and the binding that gathers from it. Null when this
+    // layer keeps its history in `history`. A non-null stream_history with a
+    // null slot is a layer the host housed but declined to gather: it reads its
+    // ring in place, which the doubled row makes correct without a mirror pass.
+    float* stream_history = nullptr;
+    StreamSlot slot = nullptr;
+    // Sizing this layer was built with. A streamed layer is BlockAligned
+    // whatever the model asked for, so every later write_pos reset has to read
+    // it from here rather than from the model.
+    RingPolicy policy = RingPolicy::Exact;
   #if NAM_A2_RING_MODE == 1
     // Exactly-sized ring + tail mirror. Storage = (ring_size + max_buffer_size)
     // cols; write_pos stays in [0, ring_size) and reads are contiguous because
@@ -272,12 +288,30 @@ private:
   int _ring_policy = NAM_A2_RING_POLICY_DEFAULT;
   bool _frame_major() const { return _kernel == 1 || _kernel == 2; }
 
+  /// Streamer this instance captured at construction, and the host's handle for
+  /// it. Both null when no streamer was installed, or when it declined.
+  const HistoryStreamer* _streamer = nullptr;
+  ModelToken _model_token = nullptr;
+  /// Layer indices with a bound slot, in bind order. prefetch() takes write
+  /// positions in this order, so it is also the host's slot order.
+  std::array<int, kNumLayers> _streamed{};
+  int _streamed_count = 0;
+
+  /// House and, if the host will have it, bind one layer's ring. Sets every
+  /// geometry field on success. False leaves L untouched for the caller's
+  /// model-owned path.
+  bool _house_streamed(Layer& L, int layer_idx, int maxBufferSize);
+  /// Unbind, free and forget every streamed layer. Idempotent.
+  void _release_streaming();
+
   #if NAM_A2_HAVE_MVE
   void _ring_write_fm(Layer& L, int num_frames);
   template <int KernelSize>
   void _layer_forward_fm(Layer& L, const float* cond, int num_frames);
   template <int KernelSize>
   void _layer_forward_fm2(Layer& L, const float* cond, int num_frames);
+  template <int KernelSize>
+  void _layer_forward_stream(Layer& L, const float* taps, const float* cond, int num_frames);
   void _head_ring_write_fm(int num_frames);
   void _head_forward_fm(float* output, int num_frames);
   #endif
@@ -299,6 +333,11 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
   // Latch the kernel choice for this instance now: the history layout follows
   // from it, so it must be settled before SetMaxBufferSize() sizes anything.
   _kernel = g_pending_kernel;
+  // Captured, not re-read later, for the same reason as the weight arena: a
+  // SetHistoryStreamer() after this point must not strand what we hold.
+  _streamer = g_history_streamer;
+  if (_streamer != nullptr && _streamer->open_model != nullptr)
+    _model_token = _streamer->open_model(_streamer->ctx);
 
   // Latched for the same reason as the kernel: SetMaxBufferSize() sizes the
   // rings from it and nothing may change afterwards.
@@ -387,6 +426,11 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
 template <int Channels>
 A2FastModel<Channels>::~A2FastModel()
 {
+  _release_streaming();
+  if (_streamer != nullptr && _model_token != nullptr && _streamer->close_model != nullptr)
+    _streamer->close_model(_model_token, _streamer->ctx);
+  _model_token = nullptr;
+
   // Released to whichever arena issued it, not to whichever is current.
   if (_weights != nullptr)
   {
@@ -579,6 +623,82 @@ inline void copy_block(float* dst, const float* src, int nf)
 }
 } // namespace
 
+// -----------------------------------------------------------------------------
+// Streamed-layer housing.
+//
+// A streamed layer overrides the model's ring policy with BlockAligned and a
+// doubled row. Both are forced by the gather rather than chosen: block-aligned
+// so a ring write never straddles into two runtime-length copies the host would
+// have to follow, and doubled so the span from the deepest gathered tap to the
+// end of the newest is one contiguous run at every write position -- which is
+// what makes the gather a single fixed-stride descriptor instead of a
+// wrap-dependent pair.
+//
+// The span fits because the newest tap is peeled to _layer_in: what is gathered
+// is (K-2)*D + nf, which is at most one ring. a2_fast.h static_asserts it.
+// -----------------------------------------------------------------------------
+template <int Channels>
+bool A2FastModel<Channels>::_house_streamed(Layer& L, int layer_idx, int maxBufferSize)
+{
+  if (_streamer == nullptr || _model_token == nullptr || _streamer->alloc_history == nullptr)
+    return false;
+
+  const int ring = streamed_ring_frames(layer_idx, maxBufferSize);
+  const int row = streamed_row_floats(layer_idx, maxBufferSize);
+  const std::size_t floats = static_cast<std::size_t>(Channels) * row;
+
+  float* block = _streamer->alloc_history(floats, _model_token, _streamer->ctx);
+  if (block == nullptr)
+    return false;
+
+  L.stream_history = block;
+  L.rows = block;
+  L.ring_size = ring;
+  L.row_stride = row;
+  // ring_start(), not 0: both are block-aligned, but the rule for where a ring
+  // starts has one home.
+  L.policy = RingPolicy::BlockAligned;
+  L.write_pos = ring_start(L.policy, L.max_lookback, maxBufferSize);
+  L.read_base = read_base_of(L.write_pos, maxBufferSize, L.max_lookback, ring);
+
+  if (_streamer->bind == nullptr)
+    return true;
+
+  StreamGeometry g;
+  g.layer = layer_idx;
+  g.channels = Channels;
+  g.taps = L.kernel_size - 1;
+  g.dilation = L.dilation;
+  g.frames_per_block = maxBufferSize;
+  g.ring_frames = ring;
+  g.row_floats = row;
+  g.history = block;
+
+  L.slot = _streamer->bind(g, _model_token, _streamer->ctx);
+  if (L.slot != nullptr)
+    _streamed[_streamed_count++] = layer_idx;
+  return true;
+}
+
+template <int Channels>
+void A2FastModel<Channels>::_release_streaming()
+{
+  if (_streamer == nullptr)
+    return;
+
+  for (auto& L : _layers)
+  {
+    if (L.slot != nullptr && _streamer->unbind != nullptr)
+      _streamer->unbind(L.slot, _model_token, _streamer->ctx);
+    L.slot = nullptr;
+    if (L.stream_history != nullptr && _streamer->free_history != nullptr)
+      _streamer->free_history(L.stream_history, _model_token, _streamer->ctx);
+    L.stream_history = nullptr;
+    L.rows = nullptr;
+  }
+  _streamed_count = 0;
+}
+
 template <int Channels>
 void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 {
@@ -602,27 +722,44 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
   _cond.assign(static_cast<size_t>(maxBufferSize), 0.0f);
   _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
 
-  for (auto& L : _layers)
+  // Re-sizing rebinds: geometry the host was told about is now stale.
+  _release_streaming();
+
+  // Only frame-major kernels read through Layer::rows, so only they can be
+  // handed a host ring. The reference path keeps every history in `history`.
+  const bool offer = _frame_major() && _model_token != nullptr;
+
+  for (int i = 0; i < kNumLayers; i++)
   {
+    Layer& L = _layers[i];
   #if NAM_A2_RING_MODE == 1
+    if (offer && layer_is_streamable(i, maxBufferSize) && _house_streamed(L, i, maxBufferSize))
+    {
+      // Housed by the host. `history` stays empty; nothing reads it.
+      std::fill_n(L.rows, static_cast<size_t>(Channels) * L.row_stride, 0.0f);
+      continue;
+    }
+
     // Exactly max_lookback + one block, no rounding: the read window is then
     // precisely the whole ring, with the deepest tap sitting where the NEXT
     // block writes. Rounding up to a power of two to make the wrap a mask costs
     // 40% (131.4K vs 78.9K per model); it lost on cycles with histories in DTCM
     // and again after they moved to RAM_HEAP, so it is not an option here.
     // BlockAligned is the other 1.3%, and is a different trade - see RingPolicy.
-    const RingPolicy policy = static_cast<RingPolicy>(_ring_policy);
-    L.ring_size = ring_frames(policy, L.max_lookback, maxBufferSize);
-    L.write_pos = ring_start(policy, L.max_lookback, maxBufferSize);
+    L.policy = static_cast<RingPolicy>(_ring_policy);
+    L.ring_size = ring_frames(L.policy, L.max_lookback, maxBufferSize);
+    L.write_pos = ring_start(L.policy, L.max_lookback, maxBufferSize);
     L.read_base = read_base_of(L.write_pos, maxBufferSize, L.max_lookback, L.ring_size);
     L.history.assign(static_cast<size_t>(Channels) * (L.ring_size + maxBufferSize), 0.0f);
     // Frame-major reads row c at [c * row_stride]; the reference kernel ignores
     // this. Same allocation, different interpretation.
     L.row_stride = L.ring_size + maxBufferSize;
+    L.rows = L.history.data();
   #else
     L.history_cols = 2 * L.max_lookback + maxBufferSize;
     L.history.assign(static_cast<size_t>(Channels) * L.history_cols, 0.0f);
     L.write_pos = L.max_lookback;
+    L.rows = L.history.data();
   #endif
   }
 
@@ -667,20 +804,20 @@ void A2FastModel<Channels>::PrewarmFromCache()
 {
   for (auto& L : _layers)
   {
-    const size_t columns = L.history.size() / Channels;
     if (_frame_major())
     {
       // Row c is uniformly the cached value for channel c. Same steady state as
       // the column-major fill below, written in the transposed layout.
       for (int c = 0; c < Channels; c++)
       {
-        float* row = L.history.data() + static_cast<size_t>(c) * L.row_stride;
+        float* row = L.rows + static_cast<size_t>(c) * L.row_stride;
         for (int t = 0; t < L.row_stride; t++)
           row[t] = L.cached_prewarm_state[c];
       }
     }
     else
     {
+      const size_t columns = L.history.size() / Channels;
       for (size_t column = 0; column < columns; column++)
       {
         std::copy(L.cached_prewarm_state.begin(), L.cached_prewarm_state.end(),
@@ -688,7 +825,7 @@ void A2FastModel<Channels>::PrewarmFromCache()
       }
     }
   #if NAM_A2_RING_MODE == 1
-    L.write_pos = ring_start(static_cast<RingPolicy>(_ring_policy), L.max_lookback, GetMaxBufferSize());
+    L.write_pos = ring_start(L.policy, L.max_lookback, GetMaxBufferSize());
     L.read_base = read_base_of(L.write_pos, GetMaxBufferSize(), L.max_lookback, L.ring_size);
   #else
     L.write_pos = L.max_lookback;
@@ -733,7 +870,7 @@ void A2FastModel<Channels>::CacheStateAsPrewarmed()
     if (_frame_major())
     {
       for (int c = 0; c < Channels; c++)
-        L.cached_prewarm_state[c] = L.history[static_cast<size_t>(c) * L.row_stride + last_column];
+        L.cached_prewarm_state[c] = L.rows[static_cast<size_t>(c) * L.row_stride + last_column];
     }
     else
     {
@@ -846,8 +983,26 @@ void A2FastModel<Channels>::_ring_write_fm(Layer& L, int num_frames)
 
   const int wp = L.write_pos;
   const int stride = L.row_stride;
-  float* const hist = L.history.data();
+  float* const hist = L.rows;
   const float* const src = _layer_in.data();
+
+  // Doubled row: write the block at wp and again at its mirror, both
+  // contiguous because a streamed ring is BlockAligned so wp + nf <= ring_size.
+  // Costs one extra block copy per row per block and retires the straddle split
+  // and the conditional mirror pass together.
+  if (L.stream_history != nullptr)
+  {
+    for (int c = 0; c < Channels; c++)
+    {
+      float* row = hist + static_cast<size_t>(c) * stride;
+      const float* srow = src + static_cast<size_t>(c) * mbs;
+      copy_row(row + wp, srow, nf);
+      copy_row(row + L.ring_size + wp, srow, nf);
+    }
+    L.write_pos = wrap_fwd(wp + nf, L.ring_size);
+    L.read_base = read_base_of(L.write_pos, nf, L.max_lookback, L.ring_size);
+    return;
+  }
 
   // Tail mirror: the first mbs frames repeated past ring_size, so a tap whose
   // window straddles the wrap still reads one contiguous run. Stale only when
@@ -1201,7 +1356,7 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
   const int D = L.dilation;
   const int rsz = L.ring_size;
   const int stride = L.row_stride;
-  const float* __restrict const hist = L.history.data();
+  const float* __restrict const hist = L.rows;
 
   // Physical frame index of this block's first frame, taps_back*D in the past.
   // The tail mirror guarantees [base, base + nf) is contiguous within a row.
@@ -1343,7 +1498,7 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
 
   // Row bases hoisted out of the tap loop: they are loop-invariant, but the
   // compiler recomputes hist + n*stride + b per tap when they are not.
-  const float* __restrict const row0 = L.history.data();
+  const float* __restrict const row0 = L.rows;
   const float* const row1 = row0 + stride;
   const float* const row2 = row1 + stride;
 
@@ -1514,6 +1669,183 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   vst1q_f32(lg + 2 * rs + 4, vaddq_f32(vld1q_f32(lg + 2 * rs + 4), t2b));
   } // frame-pair chunk
 }
+// -----------------------------------------------------------------------------
+// Streamed frame-major kernel (Channels == 3).
+//
+// Same math, same accumulation order and same register budget as
+// _layer_forward_fm2 -- it is that kernel with the ring walk replaced by a walk
+// over an already-gathered copy. The host handed us the K-1 historical windows
+// laid out channel-major then tap-major, oldest tap first, so a tap advances by
+// nf and a channel by (K-1)*nf. Both are constants: no read_base, no dilation
+// in an address, no wrap.
+//
+// The newest tap still comes from _layer_in, which is why the host gathers K-1
+// windows rather than K, and why what it gathers is untouched by this block's
+// own ring write.
+//
+// Bit-identical to _layer_forward_fm2 by construction: the gathered floats are
+// the ring's floats, and every FMA happens in the same order on the same lanes.
+// -----------------------------------------------------------------------------
+template <int Channels>
+template <int KernelSize>
+void A2FastModel<Channels>::_layer_forward_stream(Layer& L, const float* taps, const float* cond,
+                                                  int num_frames)
+{
+  static_assert(Channels == 3, "streamed kernel is written for a 3-channel layer");
+  constexpr int K = KernelSize;
+
+    #if NAM_A2_FIXED_BLOCK > 0
+  constexpr int nf = kFixedBlock;
+  constexpr int mbs = kFixedBlock;
+  (void)num_frames;
+  static_assert(nf % 8 == 0, "streamed kernel processes whole pairs of 4-frame groups");
+    #else
+  const int nf = num_frames;
+  const int mbs = GetMaxBufferSize();
+    #endif
+
+  const int rs = mbs;
+  const int cs = (K - 1) * nf; // gathered floats per channel row
+
+  float* __restrict const lin = _layer_in.data();
+  float* __restrict const hsum = _head_sum.data();
+  const float* __restrict const cw = L.conv_w;
+  const float* __restrict const lw = L.l1x1_w;
+  const float* __restrict const gathered = taps;
+
+  for (int g0 = 0; g0 < nf; g0 += 8)
+  {
+  const float* const cg = cond + g0;
+  float* __restrict const hg = hsum + g0;
+  float* __restrict const lg = lin + g0;
+
+  float32x4_t z0a = vdupq_n_f32(L.conv_b[0]);
+  float32x4_t z0b = z0a;
+  float32x4_t z1a = vdupq_n_f32(L.conv_b[1]);
+  float32x4_t z1b = z1a;
+  float32x4_t z2a = vdupq_n_f32(L.conv_b[2]);
+  float32x4_t z2b = z2a;
+
+  for (int k = 0; k < K - 1; k++)
+  {
+    const float* w = cw + static_cast<size_t>(k) * 9;
+    const float* const p = gathered + static_cast<size_t>(k) * nf + g0;
+
+    float32x4_t x = vld1q_f32(p);
+    z0a = vfmaq_n_f32(z0a, x, w[0]);
+    z1a = vfmaq_n_f32(z1a, x, w[1]);
+    z2a = vfmaq_n_f32(z2a, x, w[2]);
+    x = vld1q_f32(p + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[0]);
+    z1b = vfmaq_n_f32(z1b, x, w[1]);
+    z2b = vfmaq_n_f32(z2b, x, w[2]);
+
+    x = vld1q_f32(p + cs);
+    z0a = vfmaq_n_f32(z0a, x, w[3]);
+    z1a = vfmaq_n_f32(z1a, x, w[4]);
+    z2a = vfmaq_n_f32(z2a, x, w[5]);
+    x = vld1q_f32(p + cs + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[3]);
+    z1b = vfmaq_n_f32(z1b, x, w[4]);
+    z2b = vfmaq_n_f32(z2b, x, w[5]);
+
+    x = vld1q_f32(p + 2 * cs);
+    z0a = vfmaq_n_f32(z0a, x, w[6]);
+    z1a = vfmaq_n_f32(z1a, x, w[7]);
+    z2a = vfmaq_n_f32(z2a, x, w[8]);
+    x = vld1q_f32(p + 2 * cs + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[6]);
+    z1b = vfmaq_n_f32(z1b, x, w[7]);
+    z2b = vfmaq_n_f32(z2b, x, w[8]);
+  }
+
+  // Newest tap, from _layer_in rather than the gather.
+  {
+    const float* w = cw + static_cast<size_t>(K - 1) * 9;
+    float32x4_t x = vld1q_f32(lg);
+    z0a = vfmaq_n_f32(z0a, x, w[0]);
+    z1a = vfmaq_n_f32(z1a, x, w[1]);
+    z2a = vfmaq_n_f32(z2a, x, w[2]);
+    x = vld1q_f32(lg + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[0]);
+    z1b = vfmaq_n_f32(z1b, x, w[1]);
+    z2b = vfmaq_n_f32(z2b, x, w[2]);
+
+    x = vld1q_f32(lg + rs);
+    z0a = vfmaq_n_f32(z0a, x, w[3]);
+    z1a = vfmaq_n_f32(z1a, x, w[4]);
+    z2a = vfmaq_n_f32(z2a, x, w[5]);
+    x = vld1q_f32(lg + rs + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[3]);
+    z1b = vfmaq_n_f32(z1b, x, w[4]);
+    z2b = vfmaq_n_f32(z2b, x, w[5]);
+
+    x = vld1q_f32(lg + 2 * rs);
+    z0a = vfmaq_n_f32(z0a, x, w[6]);
+    z1a = vfmaq_n_f32(z1a, x, w[7]);
+    z2a = vfmaq_n_f32(z2a, x, w[8]);
+    x = vld1q_f32(lg + 2 * rs + 4);
+    z0b = vfmaq_n_f32(z0b, x, w[6]);
+    z1b = vfmaq_n_f32(z1b, x, w[7]);
+    z2b = vfmaq_n_f32(z2b, x, w[8]);
+  }
+
+  const float32x4_t ca = vld1q_f32(cg);
+  const float32x4_t cb = vld1q_f32(cg + 4);
+  z0a = vfmaq_n_f32(z0a, ca, L.mixin_w[0]);
+  z0b = vfmaq_n_f32(z0b, cb, L.mixin_w[0]);
+  z1a = vfmaq_n_f32(z1a, ca, L.mixin_w[1]);
+  z1b = vfmaq_n_f32(z1b, cb, L.mixin_w[1]);
+  z2a = vfmaq_n_f32(z2a, ca, L.mixin_w[2]);
+  z2b = vfmaq_n_f32(z2b, cb, L.mixin_w[2]);
+
+  z0a = vmulq_m_n_f32(z0a, z0a, kLeakySlope, vcmpltq_n_f32(z0a, 0.0f));
+  z0b = vmulq_m_n_f32(z0b, z0b, kLeakySlope, vcmpltq_n_f32(z0b, 0.0f));
+  z1a = vmulq_m_n_f32(z1a, z1a, kLeakySlope, vcmpltq_n_f32(z1a, 0.0f));
+  z1b = vmulq_m_n_f32(z1b, z1b, kLeakySlope, vcmpltq_n_f32(z1b, 0.0f));
+  z2a = vmulq_m_n_f32(z2a, z2a, kLeakySlope, vcmpltq_n_f32(z2a, 0.0f));
+  z2b = vmulq_m_n_f32(z2b, z2b, kLeakySlope, vcmpltq_n_f32(z2b, 0.0f));
+
+  vst1q_f32(hg, vaddq_f32(vld1q_f32(hg), z0a));
+  vst1q_f32(hg + 4, vaddq_f32(vld1q_f32(hg + 4), z0b));
+  vst1q_f32(hg + rs, vaddq_f32(vld1q_f32(hg + rs), z1a));
+  vst1q_f32(hg + rs + 4, vaddq_f32(vld1q_f32(hg + rs + 4), z1b));
+  vst1q_f32(hg + 2 * rs, vaddq_f32(vld1q_f32(hg + 2 * rs), z2a));
+  vst1q_f32(hg + 2 * rs + 4, vaddq_f32(vld1q_f32(hg + 2 * rs + 4), z2b));
+
+  float32x4_t t0a = vdupq_n_f32(L.l1x1_b[0]);
+  float32x4_t t0b = t0a;
+  float32x4_t t1a = vdupq_n_f32(L.l1x1_b[1]);
+  float32x4_t t1b = t1a;
+  float32x4_t t2a = vdupq_n_f32(L.l1x1_b[2]);
+  float32x4_t t2b = t2a;
+  t0a = vfmaq_n_f32(t0a, z0a, lw[0]);
+  t0b = vfmaq_n_f32(t0b, z0b, lw[0]);
+  t1a = vfmaq_n_f32(t1a, z0a, lw[1]);
+  t1b = vfmaq_n_f32(t1b, z0b, lw[1]);
+  t2a = vfmaq_n_f32(t2a, z0a, lw[2]);
+  t2b = vfmaq_n_f32(t2b, z0b, lw[2]);
+  t0a = vfmaq_n_f32(t0a, z1a, lw[3]);
+  t0b = vfmaq_n_f32(t0b, z1b, lw[3]);
+  t1a = vfmaq_n_f32(t1a, z1a, lw[4]);
+  t1b = vfmaq_n_f32(t1b, z1b, lw[4]);
+  t2a = vfmaq_n_f32(t2a, z1a, lw[5]);
+  t2b = vfmaq_n_f32(t2b, z1b, lw[5]);
+  t0a = vfmaq_n_f32(t0a, z2a, lw[6]);
+  t0b = vfmaq_n_f32(t0b, z2b, lw[6]);
+  t1a = vfmaq_n_f32(t1a, z2a, lw[7]);
+  t1b = vfmaq_n_f32(t1b, z2b, lw[7]);
+  t2a = vfmaq_n_f32(t2a, z2a, lw[8]);
+  t2b = vfmaq_n_f32(t2b, z2b, lw[8]);
+
+  vst1q_f32(lg, vaddq_f32(vld1q_f32(lg), t0a));
+  vst1q_f32(lg + 4, vaddq_f32(vld1q_f32(lg + 4), t0b));
+  vst1q_f32(lg + rs, vaddq_f32(vld1q_f32(lg + rs), t1a));
+  vst1q_f32(lg + rs + 4, vaddq_f32(vld1q_f32(lg + rs + 4), t1b));
+  vst1q_f32(lg + 2 * rs, vaddq_f32(vld1q_f32(lg + 2 * rs), t2a));
+  vst1q_f32(lg + 2 * rs + 4, vaddq_f32(vld1q_f32(lg + 2 * rs + 4), t2b));
+  } // frame-pair chunk
+}
   #endif // NAM_A2_HAVE_MVE
 
 // Runtime dispatcher: selects the K-specialized kernel for this layer.
@@ -1529,7 +1861,25 @@ void A2FastModel<Channels>::_layer_forward(int layer_idx, const float* cond, int
   {
     if (_frame_major())
     {
+      // Ring write first: it touches [write_pos, write_pos + nf), which no
+      // gathered window reaches -- every one of those ends at or before
+      // write_pos because the newest tap was peeled out. So the host's gather
+      // and this write cannot collide, and doing the write first gives an
+      // outstanding gather that much longer to land before taps() waits on it.
       _ring_write_fm(L, num_frames);
+      if (L.slot != nullptr)
+      {
+        const float* gathered = _streamer->taps(L.slot, _streamer->ctx);
+        NAM_A2_PROF_ENTER(kNamA2ProbeLayerMath);
+        switch (L.kernel_size)
+        {
+          case 6: _layer_forward_stream<6>(L, gathered, cond, num_frames); break;
+          case 15: _layer_forward_stream<15>(L, gathered, cond, num_frames); break;
+          default: NAM_FAIL(nam::Status::ErrorUnsupportedShape, "A2FastModel: unexpected kernel_size"); break;
+        }
+        NAM_A2_PROF_EXIT(kNamA2ProbeLayerMath);
+        return;
+      }
       NAM_A2_PROF_ENTER(kNamA2ProbeLayerMath);
       if (_kernel == 2)
       {
@@ -1775,6 +2125,17 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
       for (int c = 0; c < Channels; c++)
         lin[c] = _rechannel_w[c] * x;
     }
+  }
+
+  // Gather every streamed layer's windows before any layer runs. Each is read
+  // from write positions this block has not yet advanced, so one call covers
+  // the whole block and the host has until the first streamed layer to land it.
+  if (_streamed_count > 0)
+  {
+    int wp[kNumLayers];
+    for (int i = 0; i < _streamed_count; i++)
+      wp[i] = _layers[_streamed[i]].write_pos;
+    _streamer->prefetch(_model_token, wp, _streamer->ctx);
   }
 
   // Zero head accumulator.
