@@ -210,6 +210,46 @@ constexpr int weight_block_floats(int channels)
   return n;
 }
 
+/// \brief Floats in one model's working-buffer block.
+///
+/// _layer_in, _head_sum and _z are Channels rows of max_buffer_size; _cond and
+/// _head_out are one row each. All five are sized together and none carries
+/// state between blocks, so they are one allocation rather than five.
+constexpr int scratch_floats(int channels, int max_buffer_size)
+{
+  return 3 * channels * max_buffer_size // layer_in, head_sum, z
+         + 2 * max_buffer_size;         // cond, head_out
+}
+
+/// \brief Somewhere other than the heap to put a model's working buffers.
+///
+/// The same argument as WeightArena, further along: these are ~350 bytes for a
+/// 3-channel model at a block of 8, and every layer reads and writes them. By
+/// access count they are the largest single consumer of the data cache in the
+/// whole model -- larger than the ring histories, which are 200x their size but
+/// are read a few hundred floats at a time. Highest traffic per byte in the
+/// model, so the first thing worth pinning after the weights.
+///
+/// Sized from max_buffer_size, so unlike the weight block this is allocated in
+/// SetMaxBufferSize() rather than in the constructor, and reallocated if the
+/// block size changes.
+struct ScratchArena
+{
+  /// Allocate `bytes`, aligned to at least 16. Return nullptr when full --
+  /// the model then falls back to the heap rather than failing to build.
+  void* (*alloc)(std::size_t bytes, void* ctx);
+  /// Release a block previously returned by alloc(). Never called with null.
+  void (*release)(void* block, void* ctx);
+  void* ctx;
+};
+
+/// \brief Route working-buffer allocation for subsequently constructed models.
+///
+/// Sticky, like SetWeightArena(). Pass nullptr to go back to the heap. A model
+/// captures the arena at construction and uses that same one to release, so
+/// changing this later cannot strand an existing model's block.
+void SetScratchArena(const ScratchArena* arena);
+
 /// \brief Somewhere other than the heap to put model weights.
 ///
 /// The weights are ~8% of a model's bytes but roughly 30% of its per-block

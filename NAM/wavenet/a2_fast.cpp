@@ -126,6 +126,10 @@ int g_pending_ring_policy = NAM_A2_RING_POLICY_DEFAULT;
 /// Null means the heap. Read once, in the constructor, and captured there.
 const WeightArena* g_weight_arena = nullptr;
 
+/// Arena the next A2FastModel construction will take its working buffers from.
+/// Null means the heap. Captured in the constructor, used in SetMaxBufferSize.
+const ScratchArena* g_scratch_arena = nullptr;
+
 // =============================================================================
 // A2FastModel<Channels>
 //
@@ -236,12 +240,26 @@ private:
   int _head_write_pos = 0;
   #endif
 
-  // Working buffers (all Channels rows, max_buffer_size cols, col-major).
-  std::vector<float> _layer_in; // current layer input / next layer input (in-place residual)
-  std::vector<float> _head_sum; // accumulates activations across all layers
-  std::vector<float> _z; // per-layer conv output accumulator (tap-major)
-  std::vector<float> _cond; // float32 copy of the double NAM_SAMPLE input, reused each block
-  std::vector<float> _head_out; // float32 head output before writing to NAM_SAMPLE
+  // Working buffers (all Channels rows, max_buffer_size cols, col-major), as
+  // views into one _scratch block. None of them carries state across a block --
+  // every one is written before it is read -- which is why they can share an
+  // allocation and why that allocation never has to be preserved.
+  float* _layer_in = nullptr;  // current layer input / next layer input (in-place residual)
+  float* _head_sum = nullptr;  // accumulates activations across all layers
+  float* _z = nullptr;         // per-layer conv output accumulator (tap-major)
+  float* _cond = nullptr;      // float32 copy of the double NAM_SAMPLE input, reused each block
+  float* _head_out = nullptr;  // float32 head output before writing to NAM_SAMPLE
+
+  /// The five above, in one block -- see scratch_floats(). Sized by
+  /// SetMaxBufferSize(), so it is released and reallocated if that changes.
+  float* _scratch = nullptr;
+  /// The arena to ask, captured at construction for the same reason as _arena:
+  /// a later SetScratchArena() must not strand what we hold.
+  const ScratchArena* _scratch_arena = nullptr;
+  /// Whether the block currently held actually came from it. A refused slot
+  /// falls back to the heap for that block only -- the arena is still asked
+  /// again on the next resize, since a slot may have been freed since.
+  bool _scratch_from_arena = false;
 
   /// Every weight, in one contiguous block -- see weight_block_floats(). Held
   /// as one allocation so the arena needs only alloc/release once per model,
@@ -257,6 +275,10 @@ private:
   bool _has_cached_prewarm_state = false;
 
   void _load_weights(std::vector<float>& weights);
+  /// Size and carve _scratch. Releases any previous block first.
+  void _alloc_scratch(int maxBufferSize);
+  /// Release _scratch to whichever arena issued it. Idempotent.
+  void _free_scratch();
   bool HasCachedPrewarmState() const { return _has_cached_prewarm_state; }
   void PrewarmFromCache();
   void CacheStateAsPrewarmed();
@@ -320,6 +342,10 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
 
   // After the downgrades, so this is what will actually run.
   g_last_kernel = _kernel;
+
+  // Captured, not re-read: SetMaxBufferSize() allocates from it later, and a
+  // SetScratchArena() in between must not change which arena frees the block.
+  _scratch_arena = g_scratch_arena;
 
   // One block for every weight, from the arena when one is set. Falling back
   // to the heap rather than failing keeps a full pool from turning into a
@@ -390,6 +416,8 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
 template <int Channels>
 A2FastModel<Channels>::~A2FastModel()
 {
+  _free_scratch();
+
   // Released to whichever arena issued it, not to whichever is current.
   if (_weights != nullptr)
   {
@@ -583,6 +611,58 @@ inline void copy_block(float* dst, const float* src, int nf)
 } // namespace
 
 template <int Channels>
+void A2FastModel<Channels>::_free_scratch()
+{
+  if (_scratch == nullptr)
+    return;
+  if (_scratch_from_arena && _scratch_arena != nullptr && _scratch_arena->release != nullptr)
+    _scratch_arena->release(_scratch, _scratch_arena->ctx);
+  else
+    delete[] _scratch;
+  _scratch = nullptr;
+  _scratch_from_arena = false;
+}
+
+// One allocation, carved five ways. The order is the declaration order and
+// nothing depends on it.
+//
+// The block is zeroed because the vectors it replaces were, not because any
+// read of it needs that: _head_sum is memset every block, _layer_in and _cond
+// are written by the rechannel loop, _z by each layer's first tap, _head_out by
+// the head. Zeroing keeps the old behaviour exactly, and a DTCM pool is NOLOAD,
+// so the alternative to being right about all five is garbage rather than zero.
+template <int Channels>
+void A2FastModel<Channels>::_alloc_scratch(int maxBufferSize)
+{
+  _free_scratch();
+
+  const int floats = scratch_floats(Channels, maxBufferSize);
+  const std::size_t bytes = static_cast<std::size_t>(floats) * sizeof(float);
+
+  if (_scratch_arena != nullptr && _scratch_arena->alloc != nullptr)
+  {
+    _scratch = static_cast<float*>(_scratch_arena->alloc(bytes, _scratch_arena->ctx));
+    _scratch_from_arena = (_scratch != nullptr);
+  }
+
+  // A full pool falls back to the heap rather than failing to build, for the
+  // same reason the weight block does: slower is recoverable, absent is not.
+  if (_scratch == nullptr)
+    _scratch = new float[floats];
+
+  for (int i = 0; i < floats; i++)
+    _scratch[i] = 0.0f;
+
+  const int rows = Channels * maxBufferSize;
+  float* p = _scratch;
+  _layer_in = p; p += rows;
+  _head_sum = p; p += rows;
+  _z = p;        p += rows;
+  _cond = p;     p += maxBufferSize;
+  _head_out = p;
+}
+
+template <int Channels>
 void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 {
   #if NAM_A2_FIXED_BLOCK > 0
@@ -599,11 +679,7 @@ void A2FastModel<Channels>::SetMaxBufferSize(int maxBufferSize)
 
   DSP::SetMaxBufferSize(maxBufferSize);
 
-  _layer_in.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
-  _head_sum.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
-  _z.assign(static_cast<size_t>(Channels) * maxBufferSize, 0.0f);
-  _cond.assign(static_cast<size_t>(maxBufferSize), 0.0f);
-  _head_out.assign(static_cast<size_t>(maxBufferSize), 0.0f);
+  _alloc_scratch(maxBufferSize);
 
   for (auto& L : _layers)
   {
@@ -786,7 +862,7 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
 
   #if NAM_A2_RING_MODE == 1
   float* const hist = L.history.data();
-  const float* const src = _layer_in.data();
+  const float* const src = _layer_in;
   const int wp = L.write_pos;
   // Split rather than std::min: on the no-wrap path the copy length is nf,
   // which is a compile-time constant under NAM_A2_FIXED_BLOCK, so GCC expands
@@ -824,7 +900,7 @@ void A2FastModel<Channels>::_ring_write(Layer& L, int num_frames)
                  static_cast<size_t>(keep) * Channels * sizeof(float));
     L.write_pos = keep;
   }
-  std::memcpy(L.history.data() + static_cast<size_t>(L.write_pos) * Channels, _layer_in.data(),
+  std::memcpy(L.history.data() + static_cast<size_t>(L.write_pos) * Channels, _layer_in,
               static_cast<size_t>(nf) * Channels * sizeof(float));
   L.write_pos += nf;
   #endif
@@ -850,7 +926,7 @@ void A2FastModel<Channels>::_ring_write_fm(Layer& L, int num_frames)
   const int wp = L.write_pos;
   const int stride = L.row_stride;
   float* const hist = L.history.data();
-  const float* const src = _layer_in.data();
+  const float* const src = _layer_in;
 
   // Tail mirror: the first mbs frames repeated past ring_size, so a tap whose
   // window straddles the wrap still reads one contiguous run. Stale only when
@@ -910,7 +986,7 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
   // Column-major head history, for the reference kernel only. The frame-major
   // kernels use _head_ring_write_fm, which needs no transpose: _head_sum is
   // already frame-major when they produce it, so the copy is row to row.
-  const float* const src = _head_sum.data();
+  const float* const src = _head_sum;
 
   const int wp = _head_write_pos;
   // Same no-wrap split as _ring_write, for the same reason.
@@ -944,7 +1020,7 @@ void A2FastModel<Channels>::_head_ring_write(int num_frames)
                  static_cast<size_t>(keep) * Channels * sizeof(float));
     _head_write_pos = keep;
   }
-  std::memcpy(_head_history.data() + static_cast<size_t>(_head_write_pos) * Channels, _head_sum.data(),
+  std::memcpy(_head_history.data() + static_cast<size_t>(_head_write_pos) * Channels, _head_sum,
               static_cast<size_t>(nf) * Channels * sizeof(float));
   _head_write_pos += nf;
   #endif
@@ -999,7 +1075,7 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     // before the frame loop, the c-reduction kept in scalar temps a0/a1/a2 so
     // the compiler keeps them in FP registers across the frame loop. Mirrors
     // the nam2c --fused structure.
-    float* z = _z.data();
+    float* z = _z;
 
     // Tap 0: seed z with conv_b (saves the memset-to-zero pass) and fold in
     // the first tap's FMAs.
@@ -1127,9 +1203,9 @@ void A2FastModel<Channels>::_layer_forward_k(Layer& L, const float* cond, int nu
     Eigen::Map<const VecC> l1x1_b_vec(L.l1x1_b);
     Eigen::Map<const RowDyn> cond_row(cond, 1, nf);
 
-    Eigen::Map<MatCDyn> ztile(_z.data(), Channels, nf);
-    Eigen::Map<MatCDyn> hsum_block(_head_sum.data(), Channels, nf);
-    Eigen::Map<MatCDyn> lin_block(_layer_in.data(), Channels, nf);
+    Eigen::Map<MatCDyn> ztile(_z, Channels, nf);
+    Eigen::Map<MatCDyn> hsum_block(_head_sum, Channels, nf);
+    Eigen::Map<MatCDyn> lin_block(_layer_in, Channels, nf);
 
     ztile.setZero();
 
@@ -1202,8 +1278,8 @@ void A2FastModel<Channels>::_layer_forward_fm(Layer& L, const float* cond, int n
   // The tail mirror guarantees [base, base + nf) is contiguous within a row.
   auto tap_base = [&](int taps_back) { return wrap_back(L.write_pos - nf - taps_back * D, rsz); };
 
-  float* __restrict const lin = _layer_in.data();
-  float* __restrict const hsum = _head_sum.data();
+  float* __restrict const lin = _layer_in;
+  float* __restrict const hsum = _head_sum;
 
   // __restrict is honest: the weight block is written once at load time and is
   // read-only from the kernels. Codegen-neutral on GCC 14.3 - documentation.
@@ -1324,8 +1400,8 @@ void A2FastModel<Channels>::_layer_forward_fm2(Layer& L, const float* cond, int 
   const float* const row1 = row0 + stride;
   const float* const row2 = row1 + stride;
 
-  float* __restrict const lin = _layer_in.data();
-  float* __restrict const hsum = _head_sum.data();
+  float* __restrict const lin = _layer_in;
+  float* __restrict const hsum = _head_sum;
   // __restrict is honest: the weight block is written once at load time and is
   // read-only from the kernels. Codegen-neutral on GCC 14.3 - documentation.
   const float* __restrict const cw = L.conv_w;
@@ -1531,7 +1607,7 @@ void A2FastModel<Channels>::_head_ring_write_fm(int num_frames)
   const int wp = _head_write_pos;
   const int stride = _head_row_stride;
   float* const hist = _head_history.data();
-  const float* const src = _head_sum.data();
+  const float* const src = _head_sum;
 
   const bool wrapped = (wp + nf > _head_ring_size);
   // Unlike the old scalar head, the mirror is now genuinely load-bearing:
@@ -1694,7 +1770,7 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
 
   // Rechannel: layer_in[c, f] = _rechannel_w[c] * input[f] for c in Channels.
   // Also prepare float cond buffer (input copied to float for inner loops).
-  float* cond = _cond.data();
+  float* cond = _cond;
   if (_frame_major())
   {
     // _layer_in laid out as Channels rows of max_buffer_size frames.
@@ -1720,13 +1796,13 @@ void A2FastModel<Channels>::process(NAM_SAMPLE** input, NAM_SAMPLE** output, int
   }
 
   // Zero head accumulator.
-  std::memset(_head_sum.data(), 0, static_cast<size_t>(nf) * Channels * sizeof(float));
+  std::memset(_head_sum, 0, static_cast<size_t>(nf) * Channels * sizeof(float));
 
   for (int li = 0; li < kNumLayers; li++)
     _layer_forward(li, cond, nf);
 
   // Output.
-  float* head_out = _head_out.data();
+  float* head_out = _head_out;
   _head_forward(head_out, nf);
   for (int f = 0; f < nf; f++)
     out0[f] = static_cast<NAM_SAMPLE>(head_out[f]);
@@ -2111,6 +2187,11 @@ Kernel GetLastModelKernel()
 void SetKernelForNextModel(Kernel k)
 {
   g_pending_kernel = static_cast<int>(k);
+}
+
+void SetScratchArena(const ScratchArena* arena)
+{
+  g_scratch_arena = arena;
 }
 
 void SetWeightArena(const WeightArena* arena)
