@@ -176,6 +176,16 @@ void SetKernelForNextModel(Kernel k);
 /// adopted -- see the downgrade note above.
 Kernel GetPendingKernel();
 
+/// \brief Kernel the most recently constructed model actually adopted, after
+/// every downgrade has been applied.
+///
+/// The requested kernel and the adopted one differ silently, which is the one
+/// failure this API cannot report by returning: a downgraded model builds,
+/// runs, and produces correct output, just slowly and bit-identically to the
+/// reference. A harness that records the request rather than this cannot tell
+/// a working variant from a downgraded one.
+Kernel GetLastModelKernel();
+
 /// \brief Floats in one model's weight block, for a given channel count.
 ///
 /// Every weight lives in one contiguous block: the rechannel vector, then per
@@ -199,176 +209,6 @@ constexpr int weight_block_floats(int channels)
   n += kHeadKernelSize * channels; // head kernel
   return n;
 }
-
-// -----------------------------------------------------------------------------
-// History streaming.
-//
-// A layer's per-block reads are K windows of `frames_per_block` consecutive
-// frames at stride `dilation`, once per channel row -- a few hundred floats out
-// of a ring that runs to 9.5 KB. Caching that is hopeless; gathering it is not.
-// A host that can gather (a DMA engine, or just a copy loop) can therefore keep
-// the ring in slow memory and hand the model a compact, fast-memory copy of
-// only the windows it will read.
-//
-// Which layers qualify is fixed by the geometry: a layer whose dilation is at
-// least the block size has every tap but the newest at least one block old, and
-// the newest is peeled out of the kernel and read from the layer input. So the
-// gather for a block depends only on writes completed before that block began,
-// and can be issued at the top of the block with a whole block to land.
-//
-// Layers below that threshold keep their history in the model's own memory and
-// run the existing kernel. So does every layer when no streamer is installed,
-// or when the streamer refuses one -- streaming is an optimisation the host may
-// decline per layer, never a requirement.
-// -----------------------------------------------------------------------------
-
-/// \brief Ring capacity for a streamed layer, in frames.
-///
-/// A streamed layer is RingPolicy::BlockAligned, for the reason that policy
-/// exists: write_pos only ever lands on a block boundary, so every ring write
-/// is contiguous. This forwards rather than repeating the arithmetic - a second
-/// copy of the rule is how the two drift, and the drift is silent.
-constexpr int streamed_ring_frames(int layer, int frames_per_block)
-{
-  return ring_frames(RingPolicy::BlockAligned,
-                     (kKernelSizes[layer] - 1) * kDilations[layer],
-                     frames_per_block);
-}
-
-/// \brief Floats per channel row of a streamed layer's history.
-///
-/// Twice the ring: the second copy mirrors the first, so the span a block reads
-/// is one contiguous run at every write position and the gather is a single
-/// fixed-stride descriptor rather than a wrap-dependent pair.
-constexpr int streamed_row_floats(int layer, int frames_per_block)
-{
-  return 2 * streamed_ring_frames(layer, frames_per_block);
-}
-
-/// \brief True if this layer's taps are all at least one block old.
-constexpr bool layer_is_streamable(int layer, int frames_per_block)
-{
-  return kDilations[layer] >= frames_per_block;
-}
-
-/// \brief Floats the host must supply for one model's streamed histories.
-constexpr int streamed_history_floats(int channels, int frames_per_block)
-{
-  int n = 0;
-  for (int i = 0; i < kNumLayers; i++)
-    if (layer_is_streamable(i, frames_per_block))
-      n += channels * streamed_row_floats(i, frames_per_block);
-  return n;
-}
-
-/// \brief Floats one streamed layer's gathered windows occupy.
-///
-/// K-1 windows, not K: the newest tap comes from the layer input directly.
-/// Laid out channel-major then tap-major, so the gather writes it linearly.
-constexpr int layer_tap_floats(int layer, int channels, int frames_per_block)
-{
-  return channels * (kKernelSizes[layer] - 1) * frames_per_block;
-}
-
-/// \brief Largest layer_tap_floats() over the streamed layers. Slot size for a
-/// host that recycles a few staging buffers rather than holding all of them.
-constexpr int max_layer_tap_floats(int channels, int frames_per_block)
-{
-  int m = 0;
-  for (int i = 0; i < kNumLayers; i++)
-    if (layer_is_streamable(i, frames_per_block))
-    {
-      const int n = layer_tap_floats(i, channels, frames_per_block);
-      if (n > m) m = n;
-    }
-  return m;
-}
-
-/// \brief layer_tap_floats() summed over every streamed layer: the staging cost
-/// of holding a whole block's gather at once.
-constexpr int block_tap_floats(int channels, int frames_per_block)
-{
-  int n = 0;
-  for (int i = 0; i < kNumLayers; i++)
-    if (layer_is_streamable(i, frames_per_block))
-      n += layer_tap_floats(i, channels, frames_per_block);
-  return n;
-}
-
-/// \brief Streamed layers in a model, for sizing per-layer host tables.
-constexpr int streamed_layer_count(int frames_per_block)
-{
-  int n = 0;
-  for (int i = 0; i < kNumLayers; i++)
-    if (layer_is_streamable(i, frames_per_block)) n++;
-  return n;
-}
-
-/// \brief What the host needs to know to gather one layer's windows.
-///
-/// Pure geometry: the model states where its ring is and how it is shaped, and
-/// the host decides how to move the bytes. Fixed for the life of the binding.
-struct StreamGeometry
-{
-  int layer;            ///< Index into kKernelSizes / kDilations.
-  int channels;         ///< Rows in the history, and in the gathered block.
-  int taps;             ///< Windows to gather: kernel_size - 1.
-  int dilation;         ///< Frames between consecutive window bases.
-  int frames_per_block; ///< Floats per window.
-  int ring_frames;      ///< streamed_ring_frames(): write_pos wraps at this.
-  int row_floats;       ///< streamed_row_floats(): stride between channel rows.
-  float* history;       ///< Base of the model's ring, from alloc_history().
-};
-
-/// \brief Opaque host handles. The model stores them and passes them back.
-using ModelToken = void*;
-using StreamSlot = void*;
-
-/// \brief Somewhere other than the model's own memory to put ring histories,
-/// and something to gather from them.
-///
-/// Follows WeightArena: installed globally, captured at construction, and free
-/// to refuse. A model that gets nothing back behaves exactly as if no streamer
-/// were installed.
-struct HistoryStreamer
-{
-  /// Claim whatever the host tracks per model - a DMA channel, a staging pool.
-  /// Return nullptr to decline the whole model.
-  ModelToken (*open_model)(void* ctx);
-  /// Release a token from open_model(). Never called with nullptr.
-  void (*close_model)(ModelToken model, void* ctx);
-
-  /// Ring storage for one streamed layer, aligned to at least 16 and zeroed.
-  /// Return nullptr to decline this layer.
-  float* (*alloc_history)(std::size_t floats, ModelToken model, void* ctx);
-  /// Release a block from alloc_history(). Never called with nullptr.
-  void (*free_history)(float* block, ModelToken model, void* ctx);
-
-  /// Accept responsibility for gathering one layer. Return nullptr to decline
-  /// it; the model then reads in place the ring alloc_history() gave it, so
-  /// declining costs correctness nothing.
-  StreamSlot (*bind)(const StreamGeometry& geometry, ModelToken model, void* ctx);
-  /// Release a slot from bind(). Never called with nullptr.
-  void (*unbind)(StreamSlot slot, ModelToken model, void* ctx);
-
-  /// Start the gather for one block. `write_pos` holds one entry per streamed
-  /// layer, in bind() order, each the layer's ring write position BEFORE this
-  /// block's write -- which is what makes every gathered window at least one
-  /// block old. Called once, before any layer runs.
-  void (*prefetch)(ModelToken model, const int* write_pos, void* ctx);
-
-  /// The gathered windows for one layer, laid out channel-major then tap-major,
-  /// oldest tap first. Blocks until they are there. Never returns nullptr after
-  /// a successful bind().
-  const float* (*taps)(StreamSlot slot, void* ctx);
-
-  void* ctx;
-};
-
-/// \brief Route history allocation and gathering for subsequently constructed
-/// models. Sticky, like SetWeightArena(). Pass nullptr to go back to holding
-/// every history in the model's own memory.
-void SetHistoryStreamer(const HistoryStreamer* streamer);
 
 /// \brief Somewhere other than the heap to put model weights.
 ///

@@ -109,6 +109,10 @@ namespace a2_fast
 namespace
 {
 
+/// What the last construction settled on, after every downgrade. Read through
+/// GetLastModelKernel().
+int g_last_kernel = 0;
+
 /// Kernel that the next A2FastModel construction will adopt. Set through the
 /// public SetKernelForNextModel(); read once, in the constructor. Not
 /// thread-safe and not meant to be -- models are built during setup.
@@ -121,10 +125,6 @@ int g_pending_ring_policy = NAM_A2_RING_POLICY_DEFAULT;
 /// Arena the next A2FastModel construction will take its weight block from.
 /// Null means the heap. Read once, in the constructor, and captured there.
 const WeightArena* g_weight_arena = nullptr;
-
-/// Streamer the next A2FastModel construction will offer its deep-dilation
-/// histories to. Null means every history stays in the model's own memory.
-const HistoryStreamer* g_history_streamer = nullptr;
 
 // =============================================================================
 // A2FastModel<Channels>
@@ -317,6 +317,9 @@ A2FastModel<Channels>::A2FastModel(std::vector<float> weights, double expected_s
     // keeps the Eigen path, which already blocks over whole frames.
     _kernel = 0;
   }
+
+  // After the downgrades, so this is what will actually run.
+  g_last_kernel = _kernel;
 
   // One block for every weight, from the arena when one is set. Falling back
   // to the heap rather than failing keeps a full pool from turning into a
@@ -2161,14 +2164,14 @@ RingPolicy GetPendingRingPolicy()
   return static_cast<RingPolicy>(g_pending_ring_policy);
 }
 
+Kernel GetLastModelKernel()
+{
+  return static_cast<Kernel>(g_last_kernel);
+}
+
 void SetKernelForNextModel(Kernel k)
 {
   g_pending_kernel = static_cast<int>(k);
-}
-
-void SetHistoryStreamer(const HistoryStreamer* streamer)
-{
-  g_history_streamer = streamer;
 }
 
 void SetWeightArena(const WeightArena* arena)
