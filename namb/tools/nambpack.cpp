@@ -18,6 +18,19 @@
 // The tool refuses to emit an image larger than the pack region, because the
 // bytes past it are user data -- logs, recordings, measurements -- and a
 // too-large image would be programmed straight over them.
+//
+// Format v2 (see nambpack_format.h) puts blob storage at a fixed offset past a
+// two-slot TOC area, so the target can add a model without moving the ones
+// already there. This tool writes slot A at sequence 1 and leaves slot B
+// erased; the first commit the target makes lands in B at sequence 2. There is
+// no reason for the tool to fill both -- a freshly programmed pack has nothing
+// to fall back to yet, and an erased slot is rejected cleanly by the reader.
+//
+// This file duplicates the reader's range checks rather than including
+// nambpack_reader.h, which would drag in the NAM library for its Status type
+// and its strings. What it does NOT duplicate is the layout arithmetic and the
+// two checksums: those come from nambpack_format.h, because a disagreement
+// there is invisible until a pedal refuses to boot.
 
 #include <cstdint>
 #include <cstdio>
@@ -130,6 +143,48 @@ uint32_t align_up(uint32_t v, uint32_t a)
 
 // ----------------------------------------------------------------------------
 
+// Validate one TOC slot, mirroring PackView::ValidateSlot. Returns nullptr on
+// success, or a short reason the slot was rejected.
+//
+// An erased slot is normal, not a fault: a freshly programmed pack has only
+// slot A, and reporting that as an error would make every good pack look half
+// broken. The caller distinguishes the two through \p erased.
+const char* check_slot(const std::vector<uint8_t>& img, uint8_t slot, Header& out, bool& erased)
+{
+  using namespace nam::nambpack;
+
+  erased = false;
+  out = Header{};
+
+  const uint32_t off = TocSlotOffset(slot);
+  if (static_cast<uint64_t>(off) + TOC_SLOT_SIZE > img.size())
+    return "slot lies past the end of the file";
+
+  std::memcpy(&out, img.data() + off, sizeof(out));
+
+  if (out.magic != MAGIC)
+  {
+    erased = true;
+    return "empty (erased or never written)";
+  }
+  if (out.version != FORMAT_VERSION)
+    return "unsupported pack version";
+  if (HeaderCrc32(out) != out.header_crc32)
+    return "header checksum mismatch";
+  if (out.count > MAX_ENTRIES)
+    return "entry count exceeds MAX_ENTRIES";
+  if (out.total_size > img.size())
+    return "truncated: header claims more bytes than the file holds";
+  if (out.total_size > REGION_SIZE)
+    return "image claims more than the pack region";
+  if (out.total_size < FIRST_BLOB_OFFSET)
+    return "image does not reach the first blob offset";
+  if (TocCrc32(img.data() + off, out.count) != out.toc_crc32)
+    return "TOC checksum mismatch";
+
+  return nullptr;
+}
+
 int list_pack(const std::filesystem::path& path)
 {
   using namespace nam::nambpack;
@@ -140,50 +195,52 @@ int list_pack(const std::filesystem::path& path)
     std::fprintf(stderr, "nambpack: cannot read %s\n", path.string().c_str());
     return 1;
   }
-  if (img.size() < sizeof(Header))
+  if (img.size() < FIRST_BLOB_OFFSET)
   {
-    std::fprintf(stderr, "nambpack: %s is too small to be a pack\n", path.string().c_str());
+    std::fprintf(stderr, "nambpack: %s is too small to be a v%u pack (%u bytes minimum)\n", path.string().c_str(),
+                 (unsigned)FORMAT_VERSION, FIRST_BLOB_OFFSET);
     return 1;
   }
 
-  Header h{};
-  std::memcpy(&h, img.data(), sizeof(h));
+  std::printf("pack %s\n\n", path.string().c_str());
 
-  if (h.magic != MAGIC)
+  Header hdr[TOC_SLOT_COUNT]{};
+  bool ok[TOC_SLOT_COUNT]{};
+
+  for (uint8_t s = 0; s < TOC_SLOT_COUNT; s++)
   {
-    std::fprintf(stderr, "nambpack: bad magic (not a pack image)\n");
-    return 1;
-  }
-  if (h.version != FORMAT_VERSION)
-  {
-    std::fprintf(stderr, "nambpack: unsupported pack version %u\n", (unsigned)h.version);
-    return 1;
-  }
-  if (h.count > MAX_ENTRIES)
-  {
-    std::fprintf(stderr, "nambpack: entry count %u exceeds MAX_ENTRIES\n", (unsigned)h.count);
-    return 1;
-  }
-  if (h.total_size > img.size())
-  {
-    std::fprintf(stderr, "nambpack: truncated (header says %u bytes, file has %zu)\n", h.total_size, img.size());
-    return 1;
+    bool erased = false;
+    const char* why = check_slot(img, s, hdr[s], erased);
+    ok[s] = (why == nullptr);
+
+    std::printf("  TOC slot %c @ 0x%06X: ", (char)('A' + s), TocSlotOffset(s));
+    if (ok[s])
+      std::printf("seq %u, %u model(s), %u bytes\n", hdr[s].sequence, (unsigned)hdr[s].count, hdr[s].total_size);
+    else
+      std::printf("%s\n", why);
   }
 
-  const size_t toc_bytes = static_cast<size_t>(h.count) * sizeof(Entry);
-  if (sizeof(Header) + toc_bytes > img.size())
+  // Same arbitration the firmware runs: highest sequence wins, ties to the
+  // lower slot index.
+  uint8_t winner = TOC_SLOT_COUNT;
+  for (uint8_t s = 0; s < TOC_SLOT_COUNT; s++)
   {
-    std::fprintf(stderr, "nambpack: TOC extends past end of file\n");
-    return 1;
+    if (!ok[s])
+      continue;
+    if (winner == TOC_SLOT_COUNT || SequenceNewer(hdr[s].sequence, hdr[winner].sequence))
+      winner = s;
   }
-  const uint32_t toc_crc = nam::namb::crc32(img.data() + sizeof(Header), toc_bytes);
-  if (toc_crc != h.toc_crc32)
+
+  if (winner == TOC_SLOT_COUNT)
   {
-    std::fprintf(stderr, "nambpack: TOC checksum mismatch\n");
+    std::fprintf(stderr, "\nnambpack: no usable TOC slot -- the firmware would not open this pack\n");
     return 1;
   }
 
-  std::printf("pack %s\n", path.string().c_str());
+  const Header& h = hdr[winner];
+  const uint8_t* toc = img.data() + TocSlotOffset(winner) + sizeof(Header);
+
+  std::printf("\n  active: slot %c (sequence %u)\n", (char)('A' + winner), h.sequence);
   std::printf("  version %u, %u model(s), %u bytes (%.1f%% of the %u KiB region)\n\n", (unsigned)h.version,
               (unsigned)h.count, h.total_size, 100.0 * h.total_size / REGION_SIZE, REGION_SIZE / 1024u);
   std::printf("  %-3s %-32s %10s %10s  %s\n", "idx", "name", "offset", "size", "flash address");
@@ -192,21 +249,30 @@ int list_pack(const std::filesystem::path& path)
   for (uint16_t i = 0; i < h.count; i++)
   {
     Entry e{};
-    std::memcpy(&e, img.data() + sizeof(Header) + i * sizeof(Entry), sizeof(e));
+    std::memcpy(&e, toc + i * sizeof(Entry), sizeof(e));
     char name[NAME_SIZE + 1];
     std::memcpy(name, e.name, NAME_SIZE);
     name[NAME_SIZE] = '\0';
 
-    const bool in_range = (static_cast<uint64_t>(e.offset) + e.size) <= h.total_size;
+    const char* problem = nullptr;
+    if (e.size == 0)
+      problem = "   <-- ZERO LENGTH";
+    else if (e.offset < FIRST_BLOB_OFFSET)
+      problem = "   <-- OVERLAPS THE TOC AREA";
+    else if ((static_cast<uint64_t>(e.offset) + e.size) > h.total_size)
+      problem = "   <-- OUT OF RANGE";
+    else if (e.name[NAME_SIZE - 1] != '\0')
+      problem = "   <-- NAME NOT TERMINATED";
+
     std::printf("  %-3u %-32s %10u %10u  0x%08X%s\n", (unsigned)i, name, e.offset, e.size, FLASH_BASE + e.offset,
-                in_range ? "" : "   <-- OUT OF RANGE");
-    if (!in_range)
+                problem ? problem : "");
+    if (problem)
       bad++;
   }
 
   if (bad)
   {
-    std::fprintf(stderr, "\nnambpack: %d entry/entries out of range\n", bad);
+    std::fprintf(stderr, "\nnambpack: %d entry/entries rejected\n", bad);
     return 1;
   }
   std::printf("\n  ok\n");
@@ -353,11 +419,13 @@ int main(int argc, char** argv)
   }
 
   // --- Lay out -------------------------------------------------------------
+  // Blobs begin at FIRST_BLOB_OFFSET whatever the count. That is the whole
+  // point of v2: the target adds a model by writing past the last blob and
+  // rewriting a TOC, never by shifting the models already programmed.
   const uint16_t count = static_cast<uint16_t>(inputs.size());
   std::vector<Entry> toc(count);
 
-  uint32_t cursor = align_up(static_cast<uint32_t>(sizeof(Header)) + count * static_cast<uint32_t>(sizeof(Entry)),
-                             alignment);
+  uint32_t cursor = align_up(FIRST_BLOB_OFFSET, alignment);
 
   for (uint16_t i = 0; i < count; i++)
   {
@@ -394,17 +462,26 @@ int main(int argc, char** argv)
   std::vector<uint8_t> img(total_size, 0xFF); // 0xFF = erased flash, so padding
                                               // costs no extra program cycles
 
+  // Blobs and the TOC records first, then the header over the top, so both
+  // checksums are taken from the bytes that will actually be programmed rather
+  // than from the structures they were built out of. Cheap, and it means a
+  // layout mistake shows up as a checksum failure here instead of on the pedal.
+  for (uint16_t i = 0; i < count; i++)
+    std::memcpy(img.data() + toc[i].offset, inputs[i].data.data(), inputs[i].data.size());
+
+  const uint32_t slot_a = TocSlotOffset(0);
+  std::memcpy(img.data() + slot_a + sizeof(Header), toc.data(), toc.size() * sizeof(Entry));
+
   Header h{};
   h.magic = MAGIC;
   h.version = FORMAT_VERSION;
   h.count = count;
   h.total_size = total_size;
-  h.toc_crc32 = nam::namb::crc32(reinterpret_cast<const uint8_t*>(toc.data()), toc.size() * sizeof(Entry));
+  h.toc_crc32 = TocCrc32(img.data() + slot_a, count);
+  h.sequence = 1; // Slot B stays erased; the target's first commit becomes seq 2
+  h.header_crc32 = HeaderCrc32(h);
 
-  std::memcpy(img.data(), &h, sizeof(h));
-  std::memcpy(img.data() + sizeof(Header), toc.data(), toc.size() * sizeof(Entry));
-  for (uint16_t i = 0; i < count; i++)
-    std::memcpy(img.data() + toc[i].offset, inputs[i].data.data(), inputs[i].data.size());
+  std::memcpy(img.data() + slot_a, &h, sizeof(h));
 
   std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
   if (!f.is_open())
@@ -436,8 +513,10 @@ int main(int argc, char** argv)
     return s;
   }();
 
-  std::printf("\n  %u model(s), %u bytes total (%u payload, %u padding/TOC)\n", (unsigned)count, total_size, payload,
-              total_size - payload);
+  std::printf("\n  %u model(s), %u bytes total (%u payload, %u TOC area, %u padding)\n", (unsigned)count, total_size,
+              payload, FIRST_BLOB_OFFSET, total_size - payload - FIRST_BLOB_OFFSET);
+  std::printf("  TOC slot A written at sequence 1; slot B erased, ready for the target's first commit\n");
+  std::printf("  room for %u more model(s) in the TOC\n", (unsigned)(MAX_ENTRIES - count));
   std::printf("  region 0x%08X..0x%08X (%u KiB), %.1f%% used, %u KiB free\n", FLASH_BASE, FLASH_BASE + REGION_SIZE,
               REGION_SIZE / 1024u, 100.0 * total_size / REGION_SIZE, (REGION_SIZE - total_size) / 1024u);
   std::printf("  user data begins at 0x%08X and is untouched\n", FLASH_BASE + REGION_SIZE);
