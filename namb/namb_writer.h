@@ -1,6 +1,13 @@
 #pragma once
 // .nam (JSON) -> .namb (binary) conversion, as a library rather than a program.
 //
+// This is the FRONT END: it reads a parsed JSON document and fills the plain
+// structs in namb_config.h, which then emit the bytes. The split matters --
+// the byte layout is pinned by goldens from the pipeline that built every pack
+// ever flashed to a pedal, and it must not have to move when the thing feeding
+// it does. A streaming parser is meant to replace this file without
+// namb_config.h changing at all.
+//
 // Generic and embedded-friendly namb writer with changes from nam2namb:
 //
 //   No exceptions. The firmware builds -fno-exceptions, under which nlohmann's
@@ -9,9 +16,10 @@
 //   or a bare get<T>(); every read goes through the checked accessors below and
 //   every failure comes back as a Status plus a sentence saying what was wrong.
 //
-//   No allocation. Output goes to a caller-supplied span, and weights are
-//   streamed rather than collected, so converting a model costs no heap at all
-//   beyond whatever the caller's JSON DOM already occupies.
+//   No allocation. Output goes to a caller-supplied span, working storage to a
+//   caller-supplied ModelScratch, and weights are streamed rather than
+//   collected, so converting a model costs no heap at all beyond whatever the
+//   caller's JSON DOM already occupies.
 //
 //   A template on the JSON type. The firmware parses into nam::json_arena::
 //   arena_json, whose allocator draws from a bump arena; the host tools use
@@ -33,6 +41,9 @@
 //   if (!nam::IsOk(st)) { report(r.detail); }
 //   else                { commit(blob, r.size, r.name); }
 //
+// The overload above allocates a ModelScratch on the stack, which is ~12 KB and
+// fine on a host. The firmware passes its own; see WriteNamb's second overload.
+//
 // Only WaveNet and SlimmableContainer are understood. The other architectures
 // .namb can encode are not ones this product loads -- get_dsp_namb is built
 // NAMB_WAVENET_ONLY -- and a converter that emits models the loader rejects is
@@ -47,6 +58,7 @@
 
 #include <NAM/status.h>
 
+#include "namb_config.h"
 #include "namb_format.h"
 
 namespace nam
@@ -85,96 +97,6 @@ struct WriteResult
   uint32_t weight_count = 0; ///< Weights in the emitted blob
   char name[kNameSize] = {}; ///< Suggested pack entry name, NUL-terminated
   char detail[kDetailSize] = {}; ///< Failure reason, or "" on success
-};
-
-// =============================================================================
-// SpanWriter
-// =============================================================================
-
-/// \brief Bounds-checked writer over a fixed span.
-///
-/// Overflow is sticky rather than thrown, mirroring BinaryReader: the caller
-/// checks once at the end instead of guarding every field, and a run past the
-/// end produces a well-defined short write that is then rejected wholesale
-/// rather than a buffer overrun.
-class SpanWriter
-{
-public:
-  SpanWriter(uint8_t* data, size_t capacity)
-  : _data(data)
-  , _capacity(data == nullptr ? 0 : capacity)
-  {
-  }
-
-  bool failed() const { return _failed; }
-  size_t position() const { return _pos; }
-  uint8_t* data() { return _data; }
-
-  void write_u8(uint8_t v)
-  {
-    if (check(1))
-      _data[_pos++] = v;
-  }
-
-  void write_u16(uint16_t v) { write_raw(&v, 2); }
-  void write_u32(uint32_t v) { write_raw(&v, 4); }
-  void write_i32(int32_t v) { write_raw(&v, 4); }
-  void write_f32(float v) { write_raw(&v, 4); }
-  void write_f64(double v) { write_raw(&v, 8); }
-
-  void write_zeros(size_t n)
-  {
-    if (check(n))
-    {
-      std::memset(_data + _pos, 0, n);
-      _pos += n;
-    }
-  }
-
-  /// \brief Pad to the next multiple of \p align.
-  void align_to(size_t align)
-  {
-    while ((_pos % align) != 0)
-      write_u8(0);
-  }
-
-  /// \brief Backpatch a uint32 already written at \p offset. Silently ignored
-  ///        once the writer has overflowed, since the buffer is being discarded
-  ///        anyway and \p offset may no longer mean anything.
-  void set_u32(size_t offset, uint32_t v)
-  {
-    if (_failed || offset + 4 > _pos)
-      return;
-    std::memcpy(_data + offset, &v, 4);
-  }
-
-private:
-  template<class T>
-  void write_raw(const T* v, size_t n)
-  {
-    if (check(n))
-    {
-      std::memcpy(_data + _pos, v, n);
-      _pos += n;
-    }
-  }
-
-  bool check(size_t n)
-  {
-    if (_failed)
-      return false;
-    if (_pos + n > _capacity)
-    {
-      _failed = true;
-      return false;
-    }
-    return true;
-  }
-
-  uint8_t* _data;
-  size_t _capacity;
-  size_t _pos = 0;
-  bool _failed = false;
 };
 
 namespace writer_detail
@@ -276,12 +198,14 @@ bool BoolOr(const J& o, const char* key, bool& out)
 // Conversion context
 // =============================================================================
 
-/// Carries the output span and the diagnostic buffer through the recursion, so
-/// no function has to thread three parameters it does not use.
+/// Carries the output span, the working storage and the diagnostic buffer
+/// through the recursion, so no function has to thread three parameters it
+/// does not use.
 template<class J>
 struct Context
 {
   SpanWriter& w;
+  ModelScratch& scratch;
   char* detail;
 };
 
@@ -335,23 +259,24 @@ inline bool ActivationTypeFromName(const char* name, uint8_t& out)
 static constexpr uint8_t kActivationSigmoid = 6;
 static constexpr uint8_t kActivationTanh = 0;
 
-/// Writes one activation config: type byte, parameter count, then the floats.
+/// Resolves one activation config into \p out, claiming its parameters from
+/// \p la's pool.
 ///
 /// The parameter list is type-dependent and follows from_json exactly,
 /// including its asymmetry: a bare string "LeakyReLU" carries no slope and so
-/// emits zero parameters, while the object form defaults the slope to 0.01 and
-/// emits one. Reproducing that is what keeps this byte-identical to nam2namb.
+/// has zero parameters, while the object form defaults the slope to 0.01 and
+/// has one. Reproducing that is what keeps this byte-identical to nam2namb.
 template<class J>
-Status WriteActivation(Context<J>& ctx, const J& act, const char* where)
+Status ParseActivation(Context<J>& ctx, const J& act, const char* where, LayerArrayCfg& la, ActivationCfg& out)
 {
+  out = ActivationCfg{};
   uint8_t type = 0;
 
   if (const typename J::string_t* s = AsString(act))
   {
     if (!ActivationTypeFromName(s->c_str(), type))
       NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "%s: unknown activation '%s'", where, s->c_str());
-    ctx.w.write_u8(type);
-    ctx.w.write_u8(0); // string form carries no parameters
+    out.type = type; // string form carries no parameters
     return Status::Ok;
   }
 
@@ -365,12 +290,12 @@ Status WriteActivation(Context<J>& ctx, const J& act, const char* where)
   if (!ActivationTypeFromName(type_name->c_str(), type))
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "%s: unknown activation '%s'", where, type_name->c_str());
 
-  ctx.w.write_u8(type);
+  out.type = type;
 
   // --- gather parameters ----------------------------------------------------
   float params[8];
   size_t count = 0;
-  const J* slopes = nullptr; // PReLU per-channel, written straight from the DOM
+  const J* slopes = nullptr; // PReLU per-channel, copied into the pool below
 
   if (type == 4) // LeakyReLU
   {
@@ -417,39 +342,56 @@ Status WriteActivation(Context<J>& ctx, const J& act, const char* where)
     }
   }
 
-  // --- emit -----------------------------------------------------------------
+  // --- claim pool space and store -------------------------------------------
+  const size_t want = (slopes != nullptr) ? slopes->size() : count;
+  if (want == 0)
+    return Status::Ok;
+
+  uint16_t offset = 0;
+  float* dst = la.claim(static_cast<uint8_t>(want), offset);
+  if (dst == nullptr)
+  {
+    NAMB_FAIL(ctx, Status::ErrorTooSmall,
+              "%s: layer array needs more than %u activation parameters", where,
+              static_cast<unsigned>(kActivationParamPool));
+  }
+
   if (slopes != nullptr)
   {
-    ctx.w.write_u8(static_cast<uint8_t>(slopes->size()));
+    size_t i = 0;
     for (const auto& s : *slopes)
     {
       double v = 0.0;
       if (!AsDouble(s, v))
         NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "%s: negative_slopes must all be numbers", where);
-      ctx.w.write_f32(static_cast<float>(v));
+      dst[i++] = static_cast<float>(v);
     }
   }
   else
   {
-    ctx.w.write_u8(static_cast<uint8_t>(count));
     for (size_t i = 0; i < count; i++)
-      ctx.w.write_f32(params[i]);
+      dst[i] = params[i];
   }
 
+  out.param_count = static_cast<uint8_t>(want);
+  out.param_offset = offset;
   return Status::Ok;
 }
 
 // =============================================================================
-// FiLM parameters (4 bytes)
+// FiLM parameters
 // =============================================================================
 
 /// An ABSENT film block and a film block whose "active" is false are not the
-/// same four bytes: absent writes flags 0, while {"active":false,"shift":true}
-/// writes flags 0x02. nam2namb has always drawn that distinction and the
-/// loader reads shift independently of active, so it is preserved here.
+/// same four bytes: absent resolves to flags 0, while {"active":false,
+/// "shift":true} resolves to flags 0x02. nam2namb has always drawn that
+/// distinction and the loader reads shift independently of active, so it is
+/// preserved here.
 template<class J>
-Status WriteFilm(Context<J>& ctx, const J& layer, const char* key)
+Status ParseFilm(Context<J>& ctx, const J& layer, const char* key, FilmCfg& out)
 {
+  out = FilmCfg{}; // flags 0, groups 1 -- what an absent block resolves to
+
   const J* film = Member(layer, key);
 
   bool present = (film != nullptr);
@@ -464,20 +406,13 @@ Status WriteFilm(Context<J>& ctx, const J& layer, const char* key)
       present = false;
     else
     {
-      ctx.w.write_u8(0x01 | 0x02);
-      ctx.w.write_u8(0);
-      ctx.w.write_u16(1);
+      out.flags = 0x01 | 0x02;
       return Status::Ok;
     }
   }
 
   if (!present)
-  {
-    ctx.w.write_u8(0); // flags: not active
-    ctx.w.write_u8(0); // reserved
-    ctx.w.write_u16(1); // groups
     return Status::Ok;
-  }
 
   if (!film->is_object())
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "%s must be an object or a boolean", key);
@@ -500,9 +435,8 @@ Status WriteFilm(Context<J>& ctx, const J& layer, const char* key)
   if (shift)
     flags |= 0x02;
 
-  ctx.w.write_u8(flags);
-  ctx.w.write_u8(0);
-  ctx.w.write_u16(static_cast<uint16_t>(groups));
+  out.flags = flags;
+  out.groups = static_cast<uint16_t>(groups);
   return Status::Ok;
 }
 
@@ -579,7 +513,7 @@ Status ResolveGating(Context<J>& ctx, const J& layer, size_t n, uint8_t* out, si
 }
 
 // =============================================================================
-// Metadata block (48 bytes)
+// Metadata
 // =============================================================================
 
 /// Parses "major.minor.patch". Missing components are zero, which is what
@@ -630,25 +564,18 @@ const J* MetaField(const J* inner, const J* outer, const char* key)
 }
 
 template<class J>
-Status WriteMetadataBlock(Context<J>& ctx, const J& model, const J* outer_meta)
+Status ParseMetadata(Context<J>& ctx, const J& model, const J* outer_meta, MetadataCfg& out)
 {
+  out = MetadataCfg{};
+
   const J* version = Member(model, "version");
   const typename J::string_t* version_str = (version != nullptr) ? AsString(*version) : nullptr;
   if (version_str == nullptr)
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "model has no string 'version'");
 
-  uint8_t v[3];
-  ParseVersion(version_str->c_str(), v);
-  ctx.w.write_u8(v[0]);
-  ctx.w.write_u8(v[1]);
-  ctx.w.write_u8(v[2]);
+  ParseVersion(version_str->c_str(), out.version);
 
   const J* inner_meta = Member(model, "metadata");
-
-  uint8_t flags = 0;
-  double loudness = 0.0;
-  double input_level = 0.0;
-  double output_level = 0.0;
 
   struct Field
   {
@@ -657,9 +584,9 @@ Status WriteMetadataBlock(Context<J>& ctx, const J& model, const J* outer_meta)
     double* dest;
   };
   const Field fields[3] = {
-    {"loudness", META_HAS_LOUDNESS, &loudness},
-    {"input_level_dbu", META_HAS_INPUT_LEVEL, &input_level},
-    {"output_level_dbu", META_HAS_OUTPUT_LEVEL, &output_level},
+    {"loudness", META_HAS_LOUDNESS, &out.loudness},
+    {"input_level_dbu", META_HAS_INPUT_LEVEL, &out.input_level},
+    {"output_level_dbu", META_HAS_OUTPUT_LEVEL, &out.output_level},
   };
 
   for (const Field& f : fields)
@@ -668,24 +595,29 @@ Status WriteMetadataBlock(Context<J>& ctx, const J& model, const J* outer_meta)
     {
       if (!AsDouble(*m, *f.dest))
         NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "metadata.%s must be a number", f.key);
-      flags |= f.flag;
+      out.flags |= f.flag;
     }
   }
-  ctx.w.write_u8(flags);
 
-  double sample_rate = -1.0;
   if (const J* sr = Member(model, "sample_rate"))
   {
-    if (!AsDouble(*sr, sample_rate))
+    if (!AsDouble(*sr, out.sample_rate))
       NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "sample_rate must be a number");
   }
 
-  ctx.w.write_f64(sample_rate);
-  ctx.w.write_f64(loudness);
-  ctx.w.write_f64(input_level);
-  ctx.w.write_f64(output_level);
-  ctx.w.write_zeros(12); // reserved
+  return Status::Ok;
+}
 
+/// Reads the metadata block and emits it in one step, since every caller does
+/// both and the struct is only alive in between.
+template<class J>
+Status WriteMetadataBlock(Context<J>& ctx, const J& model, const J* outer_meta)
+{
+  MetadataCfg meta;
+  const Status st = ParseMetadata(ctx, model, outer_meta, meta);
+  if (!IsOk(st))
+    return st;
+  EmitMetadataBlock(ctx.w, meta);
   return Status::Ok;
 }
 
@@ -693,15 +625,18 @@ Status WriteMetadataBlock(Context<J>& ctx, const J& model, const J* outer_meta)
 // WaveNet layer array
 // =============================================================================
 
-/// Largest dilation count a layer array may declare. Not an arbitrary cap:
-/// num_dilations is a uint8 in the container, so 255 is the format's own limit,
-/// and the one buffer still held across the write is sized from it.
-static constexpr size_t kMaxDilations = 255;
-
+/// Reads one layer array out of the document into \p out.
+///
+/// Everything the array needs is resolved here, in whatever order the document
+/// happens to present it; the emit order is EmitLayerArray's business. That is
+/// the split: a streaming front end sees keys in document order and can fill
+/// the same struct without buffering the document.
 template<class J>
-Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
+Status ParseLayerArray(Context<J>& ctx, const J& layer, size_t la, LayerArrayCfg& out)
 {
   const unsigned la_n = static_cast<unsigned>(la);
+
+  out.reset();
 
   if (!layer.is_object())
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u is not an object", la_n);
@@ -714,6 +649,18 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
   if (n > kMaxDilations)
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: %u dilations exceeds the %u the format allows", la_n,
               static_cast<unsigned>(n), static_cast<unsigned>(kMaxDilations));
+  out.num_dilations = static_cast<uint8_t>(n);
+
+  {
+    size_t i = 0;
+    for (const auto& d : *dilations)
+    {
+      int value = 0;
+      if (!AsInt(d, value))
+        NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: dilations must all be integers", la_n);
+      out.dilations[i++] = static_cast<int32_t>(value);
+    }
+  }
 
   // --- required scalars -----------------------------------------------------
   int input_size = 0;
@@ -739,6 +686,13 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
   if (!IntOr(layer, "bottleneck", bottleneck) || !IntOr(layer, "groups_input", groups_input)
       || !IntOr(layer, "groups_input_mixin", groups_input_mixin))
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: bottleneck/groups_* must be integers", la_n);
+
+  out.input_size = static_cast<uint16_t>(input_size);
+  out.condition_size = static_cast<uint16_t>(condition_size);
+  out.channels = static_cast<uint16_t>(channels);
+  out.bottleneck = static_cast<uint16_t>(bottleneck);
+  out.groups_input = static_cast<uint16_t>(groups_input);
+  out.groups_input_mixin = static_cast<uint16_t>(groups_input_mixin);
 
   // --- head -----------------------------------------------------------------
   // The trainer nests these under "head"; older files carry head_size and
@@ -781,17 +735,15 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
   if (head_size < 0 || head_size > 65535 || head_kernel_size > 65535)
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: head size or kernel size is out of range", la_n);
 
+  out.head_size = static_cast<uint16_t>(head_size);
+  out.head_kernel_size = static_cast<uint16_t>(head_kernel_size);
+  out.head_dilation = static_cast<int32_t>(head_dilation);
+  out.head_bias = head_bias ? 1 : 0;
+
   // --- per-layer kernel sizes -----------------------------------------------
   // Exactly one of kernel_size (scalar, broadcast) or kernel_sizes (array).
-  //
-  // Validated here but not buffered: they are emitted further down, after the
-  // dilations, and holding 255 of them across the intervening code would put a
-  // kilobyte on the stack for the sake of one loop. The array is walked twice
-  // instead -- once now to reject a bad one before anything is written, once
-  // below to emit it.
   const J* ks_scalar = Member(layer, "kernel_size");
   const J* ks_array = Member(layer, "kernel_sizes");
-  int ks_broadcast = 0;
 
   if (ks_scalar != nullptr && ks_array != nullptr)
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: give kernel_size or kernel_sizes, not both", la_n);
@@ -810,33 +762,23 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
       if (!AsInt(k, value))
         NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: kernel_sizes[%u] is not an integer", la_n,
                   static_cast<unsigned>(i));
-      i++;
+      out.kernel_sizes[i++] = static_cast<int32_t>(value);
     }
   }
   else if (ks_scalar != nullptr)
   {
+    int ks_broadcast = 0;
     if (!AsInt(*ks_scalar, ks_broadcast))
       NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: kernel_size is not an integer", la_n);
+    for (size_t i = 0; i < n; i++)
+      out.kernel_sizes[i] = static_cast<int32_t>(ks_broadcast);
   }
   else
   {
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: needs kernel_size or kernel_sizes", la_n);
   }
 
-  // --- fixed block ----------------------------------------------------------
-  ctx.w.write_u16(static_cast<uint16_t>(input_size));
-  ctx.w.write_u16(static_cast<uint16_t>(condition_size));
-  ctx.w.write_u16(static_cast<uint16_t>(head_size));
-  ctx.w.write_u16(static_cast<uint16_t>(channels));
-  ctx.w.write_u16(static_cast<uint16_t>(bottleneck));
-  ctx.w.write_u16(static_cast<uint16_t>(head_kernel_size)); // v1 held a shared kernel_size here
-  ctx.w.write_u8(head_bias ? 1 : 0);
-  ctx.w.write_u8(static_cast<uint8_t>(n));
-  ctx.w.write_u16(static_cast<uint16_t>(groups_input));
-  ctx.w.write_u16(static_cast<uint16_t>(groups_input_mixin));
-  ctx.w.write_i32(static_cast<int32_t>(head_dilation)); // v2
-
-  // --- layer1x1 (4 bytes) ---------------------------------------------------
+  // --- layer1x1 -------------------------------------------------------------
   bool layer1x1_active = true;
   int layer1x1_groups = 1;
   if (const J* l1 = Member(layer, "layer1x1"))
@@ -844,11 +786,10 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
     if (!l1->is_object() || !BoolOr(*l1, "active", layer1x1_active) || !IntOr(*l1, "groups", layer1x1_groups))
       NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: layer1x1 is malformed", la_n);
   }
-  ctx.w.write_u8(layer1x1_active ? 1 : 0);
-  ctx.w.write_u16(static_cast<uint16_t>(layer1x1_groups));
-  ctx.w.write_u8(0); // reserved
+  out.layer1x1_active = layer1x1_active ? 1 : 0;
+  out.layer1x1_groups = static_cast<uint16_t>(layer1x1_groups);
 
-  // --- head1x1 (6 bytes) ----------------------------------------------------
+  // --- head1x1 --------------------------------------------------------------
   bool head1x1_active = false;
   int head1x1_out_channels = channels;
   int head1x1_groups = 1;
@@ -858,45 +799,20 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
         || !IntOr(*h1, "out_channels", head1x1_out_channels) || !IntOr(*h1, "groups", head1x1_groups))
       NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: head1x1 is malformed", la_n);
   }
-  ctx.w.write_u8(head1x1_active ? 1 : 0);
-  ctx.w.write_u16(static_cast<uint16_t>(head1x1_out_channels));
-  ctx.w.write_u16(static_cast<uint16_t>(head1x1_groups));
-  ctx.w.write_u8(0); // reserved
+  out.head1x1_active = head1x1_active ? 1 : 0;
+  out.head1x1_out_channels = static_cast<uint16_t>(head1x1_out_channels);
+  out.head1x1_groups = static_cast<uint16_t>(head1x1_groups);
 
-  // --- 8 FiLM blocks (32 bytes) ---------------------------------------------
-  static const char* kFilmKeys[8] = {
+  // --- 8 FiLM blocks --------------------------------------------------------
+  static const char* kFilmKeys[kNumFilmBlocks] = {
     "conv_pre_film",       "conv_post_film",       "input_mixin_pre_film", "input_mixin_post_film",
     "activation_pre_film", "activation_post_film", "layer1x1_post_film",   "head1x1_post_film",
   };
-  for (const char* key : kFilmKeys)
+  for (size_t i = 0; i < kNumFilmBlocks; i++)
   {
-    const Status st = WriteFilm(ctx, layer, key);
+    const Status st = ParseFilm(ctx, layer, kFilmKeys[i], out.film[i]);
     if (!IsOk(st))
       return st;
-  }
-
-  // --- dilations, then kernel sizes -----------------------------------------
-  for (const auto& d : *dilations)
-  {
-    int value = 0;
-    if (!AsInt(d, value))
-      NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: dilations must all be integers", la_n);
-    ctx.w.write_i32(static_cast<int32_t>(value));
-  }
-  // v2. Second walk of what was validated above, so nothing had to be held.
-  if (ks_array != nullptr)
-  {
-    for (const auto& k : *ks_array)
-    {
-      int value = 0;
-      (void)AsInt(k, value); // already proven convertible
-      ctx.w.write_i32(static_cast<int32_t>(value));
-    }
-  }
-  else
-  {
-    for (size_t i = 0; i < n; i++)
-      ctx.w.write_i32(static_cast<int32_t>(ks_broadcast));
   }
 
   // --- activations ----------------------------------------------------------
@@ -913,10 +829,11 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
     size_t i = 0;
     for (const auto& a : *activation)
     {
-      std::snprintf(where, sizeof(where), "layer array %u activation %u", la_n, static_cast<unsigned>(i++));
-      const Status st = WriteActivation(ctx, a, where);
+      std::snprintf(where, sizeof(where), "layer array %u activation %u", la_n, static_cast<unsigned>(i));
+      const Status st = ParseActivation(ctx, a, where, out, out.activations[i]);
       if (!IsOk(st))
         return st;
+      i++;
     }
   }
   else
@@ -925,21 +842,18 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
     std::snprintf(where, sizeof(where), "layer array %u activation", la_n);
     for (size_t i = 0; i < n; i++)
     {
-      const Status st = WriteActivation(ctx, *activation, where);
+      const Status st = ParseActivation(ctx, *activation, where, out, out.activations[i]);
       if (!IsOk(st))
         return st;
     }
   }
 
   // --- gating modes ---------------------------------------------------------
-  uint8_t gating[kMaxDilations];
   {
-    const Status st = ResolveGating(ctx, layer, n, gating, la);
+    const Status st = ResolveGating(ctx, layer, n, out.gating, la);
     if (!IsOk(st))
       return st;
   }
-  for (size_t i = 0; i < n; i++)
-    ctx.w.write_u8(gating[i]);
 
   // --- secondary activations ------------------------------------------------
   // One per layer whatever the gating, so the block is a fixed shape; the
@@ -947,17 +861,18 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
   const J* secondary = Member(layer, "secondary_activation");
   for (size_t i = 0; i < n; i++)
   {
-    if (gating[i] == GATING_NONE)
+    ActivationCfg& dst = out.secondary[i];
+    dst = ActivationCfg{};
+
+    if (out.gating[i] == GATING_NONE)
     {
-      ctx.w.write_u8(kActivationTanh); // placeholder; the type is never read
-      ctx.w.write_u8(0);
+      dst.type = kActivationTanh; // placeholder; the type is never read
       continue;
     }
 
     if (secondary == nullptr)
     {
-      ctx.w.write_u8(kActivationSigmoid); // the gate's default
-      ctx.w.write_u8(0);
+      dst.type = kActivationSigmoid; // the gate's default
       continue;
     }
 
@@ -967,13 +882,13 @@ Status WriteLayerArray(Context<J>& ctx, const J& layer, size_t la)
       if (i >= secondary->size())
         NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "layer array %u: %u secondary activations for %u dilations", la_n,
                   static_cast<unsigned>(secondary->size()), static_cast<unsigned>(n));
-      const Status st = WriteActivation(ctx, (*secondary)[i], where);
+      const Status st = ParseActivation(ctx, (*secondary)[i], where, out, dst);
       if (!IsOk(st))
         return st;
     }
     else
     {
-      const Status st = WriteActivation(ctx, *secondary, where);
+      const Status st = ParseActivation(ctx, *secondary, where, out, dst);
       if (!IsOk(st))
         return st;
     }
@@ -1055,10 +970,12 @@ Status WriteWaveNetConfig(Context<J>& ctx, const J& model)
   const J* head = Member(*config, "head");
   const J* cdsp = Member(*config, "condition_dsp");
 
-  ctx.w.write_u8(static_cast<uint8_t>(in_channels));
-  ctx.w.write_u8(head != nullptr ? 1 : 0);
-  ctx.w.write_u8(static_cast<uint8_t>(layers->size()));
-  ctx.w.write_u8(cdsp != nullptr ? 1 : 0);
+  WaveNetCfg cfg;
+  cfg.in_channels = static_cast<uint8_t>(in_channels);
+  cfg.has_head = (head != nullptr) ? 1 : 0;
+  cfg.num_layer_arrays = static_cast<uint8_t>(layers->size());
+  cfg.has_condition_dsp = (cdsp != nullptr) ? 1 : 0;
+  EmitWaveNetConfigHeader(ctx.w, cfg);
 
   if (cdsp != nullptr)
   {
@@ -1074,6 +991,9 @@ Status WriteWaveNetConfig(Context<J>& ctx, const J& model)
     if (!IsOk(meta))
       return meta;
 
+    // The nested block, layer arrays and all, is finished before this model's
+    // own layer arrays start -- so the two levels never need the scratch layer
+    // at the same time and one is enough.
     const Status block = WriteModelBlock(ctx, *cdsp);
     if (!IsOk(block))
       return block;
@@ -1082,9 +1002,10 @@ Status WriteWaveNetConfig(Context<J>& ctx, const J& model)
   size_t la = 0;
   for (const auto& layer : *layers)
   {
-    const Status st = WriteLayerArray(ctx, layer, la++);
+    const Status st = ParseLayerArray(ctx, layer, la++, ctx.scratch.layer);
     if (!IsOk(st))
       return st;
+    EmitLayerArray(ctx.w, ctx.scratch.layer);
   }
 
   return Status::Ok;
@@ -1104,29 +1025,17 @@ Status WriteModelBlock(Context<J>& ctx, const J& model)
               "architecture '%s' is not supported; this build converts WaveNet only", arch_name->c_str());
   }
 
-  ctx.w.write_u8(ARCH_WAVENET);
-  ctx.w.write_u8(0); // reserved
-
-  const size_t config_size_offset = ctx.w.position();
-  ctx.w.write_u16(0); // backpatched below
-  const size_t config_start = ctx.w.position();
+  const ModelBlockPatch patch = EmitModelBlockOpen(ctx.w, ARCH_WAVENET);
 
   const Status st = WriteWaveNetConfig(ctx, model);
   if (!IsOk(st))
     return st;
 
-  const size_t config_size = ctx.w.position() - config_start;
-  if (config_size > 65535)
+  size_t config_size = 0;
+  if (!EmitModelBlockClose(ctx.w, patch, config_size))
+  {
     NAMB_FAIL(ctx, Status::ErrorInvalidConfig, "config block is %u bytes, too large for its uint16 length",
               static_cast<unsigned>(config_size));
-
-  // set_u32 would clobber the two bytes after the field, so patch the uint16
-  // directly. Safe: the writer has not failed, so config_size_offset is inside
-  // what has been written.
-  if (!ctx.w.failed())
-  {
-    const uint16_t cs = static_cast<uint16_t>(config_size);
-    std::memcpy(ctx.w.data() + config_size_offset, &cs, 2);
   }
 
   return Status::Ok;
@@ -1211,26 +1120,14 @@ void DeriveName(const J& model, const J* outer_meta, const char* fallback, char*
 
 template<class J>
 Status WriteOneModel(const J& model, const J* outer_meta, uint8_t* out, size_t capacity, WriteResult& result,
-                     const WriteOptions& opts)
+                     const WriteOptions& opts, ModelScratch& scratch)
 {
   SpanWriter w(out, capacity);
-  Context<J> ctx{w, result.detail};
+  Context<J> ctx{w, scratch, result.detail};
 
   // ---- File header (32 bytes) ----
-  w.write_u32(nam::namb::MAGIC);
-  w.write_u16(nam::namb::FORMAT_VERSION);
-  w.write_u16(0); // flags
-
-  const size_t total_size_offset = w.position();
-  w.write_u32(0);
-  const size_t weights_offset_offset = w.position();
-  w.write_u32(0);
-  const size_t weight_count_offset = w.position();
-  w.write_u32(0);
-  const size_t model_block_size_offset = w.position();
-  w.write_u32(0);
-  w.write_u32(0); // checksum, backpatched at offset 24
-  w.write_u32(0); // reserved
+  FileHeaderPatch header;
+  EmitFileHeader(w, header);
 
   // ---- Metadata block (48 bytes at offset 32) ----
   {
@@ -1266,11 +1163,8 @@ Status WriteOneModel(const J& model, const J* outer_meta, uint8_t* out, size_t c
 
   // ---- Backpatch ----
   const uint32_t total_size = static_cast<uint32_t>(w.position());
-  w.set_u32(total_size_offset, total_size);
-  w.set_u32(weights_offset_offset, static_cast<uint32_t>(weights_offset));
-  w.set_u32(weight_count_offset, weight_count);
-  w.set_u32(model_block_size_offset, static_cast<uint32_t>(model_block_size));
-  w.set_u32(24, compute_file_crc32(out, total_size));
+  FinalizeFileHeader(w, header, total_size, static_cast<uint32_t>(weights_offset), weight_count,
+                     static_cast<uint32_t>(model_block_size), out);
 
   result.size = total_size;
   result.weight_count = weight_count;
@@ -1311,17 +1205,20 @@ int LayerArrayChannels(const J& model)
 /// \param result   Size, weight count and suggested name on success; \p detail
 ///                 carries the reason on failure.
 /// \param opts     Which submodel to take out of a container.
+/// \param scratch  Working storage, ~12 KB. Caller-owned so it is neither a
+///                 stack local nor a static; the firmware keeps one beside its
+///                 output blob.
 /// \return Status::Ok, or why the document could not be converted.
 template<class J>
-Status WriteNamb(const J& doc, uint8_t* out, size_t capacity, WriteResult& result,
-                 const WriteOptions& opts = WriteOptions{})
+Status WriteNamb(const J& doc, uint8_t* out, size_t capacity, WriteResult& result, const WriteOptions& opts,
+                 ModelScratch& scratch)
 {
   using namespace writer_detail;
 
   result = WriteResult{};
 
   SpanWriter probe(nullptr, 0); // only so a failure before any write has a ctx
-  Context<J> ctx{probe, result.detail};
+  Context<J> ctx{probe, scratch, result.detail};
 
   if (out == nullptr || capacity < FILE_HEADER_SIZE + METADATA_BLOCK_SIZE)
     NAMB_FAIL(ctx, Status::ErrorTooSmall, "output span is too small to hold even a .namb header");
@@ -1334,7 +1231,7 @@ Status WriteNamb(const J& doc, uint8_t* out, size_t capacity, WriteResult& resul
   // --- a bare model ---------------------------------------------------------
   if (*arch_name == "WaveNet")
   {
-    const Status st = WriteOneModel(doc, static_cast<const J*>(nullptr), out, capacity, result, opts);
+    const Status st = WriteOneModel(doc, static_cast<const J*>(nullptr), out, capacity, result, opts, scratch);
     if (IsOk(st))
     {
       const int ch = LayerArrayChannels(doc);
@@ -1378,7 +1275,7 @@ Status WriteNamb(const J& doc, uint8_t* out, size_t capacity, WriteResult& resul
     if (ch < 0 || static_cast<uint16_t>(ch) != opts.channels)
       continue;
 
-    const Status st = WriteOneModel(*model, outer_meta, out, capacity, result, opts);
+    const Status st = WriteOneModel(*model, outer_meta, out, capacity, result, opts, scratch);
     if (IsOk(st))
       result.channels = opts.channels;
     return st;
@@ -1388,8 +1285,19 @@ Status WriteNamb(const J& doc, uint8_t* out, size_t capacity, WriteResult& resul
             static_cast<unsigned>(opts.channels), available_len ? available : "none");
 }
 
+/// \brief Convenience overload that puts the scratch on the stack.
+///
+/// ~12 KB of it, which is nothing on a host and more than the target's 8 KiB
+/// MSP stack. Firmware callers pass their own scratch to the overload above.
+template<class J>
+Status WriteNamb(const J& doc, uint8_t* out, size_t capacity, WriteResult& result,
+                 const WriteOptions& opts = WriteOptions{})
+{
+  ModelScratch scratch;
+  return WriteNamb(doc, out, capacity, result, opts, scratch);
+}
+
 } // namespace namb
 } // namespace nam
 
 #undef NAMB_FAIL
-
