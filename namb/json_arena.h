@@ -258,9 +258,25 @@ public:
       const size_t align = alignof(T) > alignof(void*) ? alignof(T) : alignof(void*);
       if (void* p = a->Allocate(bytes, align))
         return static_cast<T*>(p);
+
+      // Exhausted, and there is deliberately no fall back to the heap.
+      //
+      // An earlier version spilled here, on the theory that the parse could
+      // finish and be rejected afterwards. That theory does not survive
+      // -fno-exceptions: operator new cannot report failure, it calls abort().
+      // So spilling a DOM the arena could not hold does not produce a
+      // rejectable result, it empties whatever heap the rest of the firmware
+      // shares and then kills the process from inside the allocator.
+      //
+      // Returning null instead faults at the point of use, which is at least
+      // local, diagnosable, and leaves the heap intact. Neither outcome is
+      // acceptable in the field, so the arena is sized past the worst case and
+      // the caller pre-flights against Capacity() rather than relying on this.
       a->NoteSpill(bytes);
+      return nullptr;
     }
 
+    // No arena bound: the host tools use this type without one.
     return static_cast<T*>(::operator new(bytes));
   }
 
