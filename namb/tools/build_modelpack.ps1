@@ -11,9 +11,13 @@
           -> nambpack         -> build/modelpack.bin
 
   Every A2 model ships as a SlimmableContainer wrapping A2-Lite (channels=3)
-  and A2-Full (channels=8), which .namb cannot represent -- hence the split.
-  Plain WaveNet .nam files are passed through unchanged, so both kinds can sit
-  in active_models together.
+  and A2-Full (channels=8). Plain WaveNet .nam files are passed through
+  unchanged, so both kinds can sit in active_models together.
+
+  nam2namb reads a container directly now (-c <channels>), so the split is not
+  what makes conversion possible any more. It stays because it names each
+  submodel <base>_ch<N>.nam, and the -Channels selection below is a filename
+  match -- one pass over active_models yields both packs.
 
   The intermediate directories are wiped on every run. That is deliberate: a
   model deleted from active_models must also disappear from the pack, and a

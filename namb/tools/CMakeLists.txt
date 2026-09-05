@@ -65,24 +65,22 @@ add_executable(nambpack nambpack.cpp)
 target_include_directories(nambpack PRIVATE "${NAM_CORE_ROOT}")
 
 # --- nam2namb ----------------------------------------------------------------
-# Unlike nambpack, this one does parse models, so it needs the core and its
-# dependencies. Kept here anyway so the whole pipeline is available from one
-# build directory -- having to cross repos midway through converting a model is
-# how mismatched tool versions creep in.
-file(GLOB NAM_SOURCES
-    "${NAM_CORE_ROOT}/NAM/*.cpp"
-    "${NAM_CORE_ROOT}/NAM/*/*.cpp")
-
-add_executable(nam2namb nam2namb.cpp ${NAM_SOURCES})
+# A shell over namb/namb_writer.h, which is also what the firmware compiles, so
+# the tool that builds a model pack and the pedal that grows one cannot produce
+# different bytes.
+#
+# It used to link the whole NAM library and Eigen, for one call into
+# activations::ActivationConfig::from_json. The writer reimplements that mapping
+# -- it has to, being generic over the JSON type -- so all that is needed now is
+# status.cpp, for ToString().
+add_executable(nam2namb nam2namb.cpp "${NAM_CORE_ROOT}/NAM/status.cpp")
 target_include_directories(nam2namb PRIVATE
     "${NAM_CORE_ROOT}"
     "${NAM_DEPS}/nlohmann")
-target_include_directories(nam2namb SYSTEM PRIVATE "${NAM_DEPS}/eigen")
-target_compile_definitions(nam2namb PRIVATE NAM_ENABLE_A2_FAST)
-target_compile_features(nam2namb PRIVATE cxx_std_20)
 
 if(MSVC)
-    target_compile_definitions(nam2namb PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
+    target_compile_definitions(nam2namb PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_compile_options(nam2namb PRIVATE /bigobj)  # nlohmann's DOM templates
 else()
     target_compile_options(nam2namb PRIVATE -Wno-psabi)
 endif()
@@ -101,3 +99,34 @@ if(MSVC)
 endif()
 
 add_custom_target(tools ALL DEPENDS nambpack nam2namb split_slimmable)
+
+# --- tests -------------------------------------------------------------------
+# Host tests for the parts the firmware shares: the pack format and its reader,
+# the JSON arena, and the .nam -> .namb writer. They run without a target board
+# and without the model library, on checked-in fixtures.
+#
+#   cmake --build <build> && ctest --test-dir <build> --output-on-failure
+
+enable_testing()
+
+set(NAMB_TESTS_DIR "${CMAKE_CURRENT_LIST_DIR}/../tests")
+
+foreach(_test pack_test arena_test writer_test)
+    add_executable(${_test} "${NAMB_TESTS_DIR}/${_test}.cpp" "${NAM_CORE_ROOT}/NAM/status.cpp")
+    target_include_directories(${_test} PRIVATE "${NAM_CORE_ROOT}" "${NAM_DEPS}/nlohmann")
+
+    # Absolute, so a test can be run from any working directory -- ctest and a
+    # hand-run from the bin/ directory both have to find the fixtures.
+    target_compile_definitions(${_test} PRIVATE "NAMB_TEST_DATA=\"${NAMB_TESTS_DIR}\"")
+
+    if(MSVC)
+        target_compile_definitions(${_test} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+        target_compile_options(${_test} PRIVATE /bigobj)
+    else()
+        target_compile_options(${_test} PRIVATE -Wno-psabi)
+    endif()
+
+    add_test(NAME ${_test} COMMAND ${_test})
+endforeach()
+
+add_custom_target(tests DEPENDS pack_test arena_test writer_test)

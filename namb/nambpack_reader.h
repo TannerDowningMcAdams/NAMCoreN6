@@ -55,7 +55,11 @@ public:
   ///                    more is rejected rather than trusted, since past this
   ///                    point is user data.
   /// \return Status::Ok, or the reason both TOC slots were rejected.
-  Status Open(const uint8_t* base = reinterpret_cast<const uint8_t*>(FLASH_BASE),
+  /// Widen through uintptr_t before the cast: FLASH_BASE is a uint32_t, and on
+  /// a 64-bit host -- where the tests and the packing tool run -- casting it
+  /// straight to a pointer is a narrowing-to-widening conversion the compiler
+  /// is right to warn about. The default is only ever used on the target.
+  Status Open(const uint8_t* base = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(FLASH_BASE)),
               uint32_t region_size = REGION_SIZE)
   {
     _base = nullptr;

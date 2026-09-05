@@ -13,5 +13,11 @@ split into their `_ch3` / `_ch8` submodels; plain WaveNet `.nam` files pass
 straight through. The pack step then selects by channel count, so the same
 directory feeds both the A2-Lite and A2-Full packs.
 
+The split is no longer needed to *convert* a container -- `nam2namb -c <n>`
+reads one directly, because the same conversion runs on the pedal, where there
+is nowhere to put an intermediate file. It stays in this pipeline because it is
+what gives each submodel a `_ch3` / `_ch8` filename, which is how the pack step
+picks between them.
+
 This is a working set, not bulk storage -- the intermediate directories are
 wiped on every run so a model removed from here also leaves the pack.
