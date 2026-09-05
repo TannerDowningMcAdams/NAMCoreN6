@@ -111,7 +111,7 @@ enable_testing()
 
 set(NAMB_TESTS_DIR "${CMAKE_CURRENT_LIST_DIR}/../tests")
 
-foreach(_test pack_test arena_test writer_test)
+foreach(_test pack_test pack_writer_test arena_test writer_test)
     add_executable(${_test} "${NAMB_TESTS_DIR}/${_test}.cpp" "${NAM_CORE_ROOT}/NAM/status.cpp")
     target_include_directories(${_test} PRIVATE "${NAM_CORE_ROOT}" "${NAM_DEPS}/nlohmann")
 
@@ -129,4 +129,4 @@ foreach(_test pack_test arena_test writer_test)
     add_test(NAME ${_test} COMMAND ${_test})
 endforeach()
 
-add_custom_target(tests DEPENDS pack_test arena_test writer_test)
+add_custom_target(tests DEPENDS pack_test pack_writer_test arena_test writer_test)
