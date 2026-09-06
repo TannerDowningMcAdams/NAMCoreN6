@@ -19,9 +19,13 @@
 // stack -- the target's MSP stack is 8 KiB. Callers own a ModelScratch and pass
 // it in; ModelLibrary keeps one as a member alongside its output blob.
 
+#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+
+#include <NAM/status.h>
 
 #include "namb_format.h"
 
@@ -52,6 +56,96 @@ static constexpr size_t kNumFilmBlocks = 8;
 /// is refused with a sentence saying so rather than silently truncated. No
 /// shipping model uses PReLU at all.
 static constexpr size_t kActivationParamPool = 2048;
+
+// =============================================================================
+// What a conversion is asked for, and what it produces
+// =============================================================================
+//
+// Neither of these says anything about how the source is parsed, so both front
+// ends share them and a caller can swap one for the other without touching its
+// own code.
+
+/// \brief Characters reserved for the failure sentence, including the NUL.
+static constexpr size_t kDetailSize = 160;
+
+/// \brief Characters reserved for the suggested pack entry name. Matches
+///        nambpack::NAME_SIZE so a result can be handed straight to a pack
+///        writer without a second truncation decision.
+static constexpr size_t kNameSize = 32;
+
+/// \brief What to convert out of the document.
+struct WriteOptions
+{
+  /// Which slimmable submodel to take, by its layer-array channel count.
+  /// Ignored for a document that is already a bare WaveNet.
+  uint16_t channels = 3;
+
+  /// Name to fall back on when the document carries none of its own.
+  ///
+  /// Not hypothetical: of the four shipping models, Deluxe_Reverb.nam has no
+  /// metadata.name at either level. The source filename is the obvious thing
+  /// to pass, and only the caller can see it.
+  const char* fallback_name = nullptr;
+};
+
+/// \brief What came out, or why nothing did.
+struct WriteResult
+{
+  size_t size = 0; ///< Bytes written to the output span
+  uint16_t channels = 0; ///< Channel count of the submodel actually converted
+  uint32_t weight_count = 0; ///< Weights in the emitted blob
+  char name[kNameSize] = {}; ///< Suggested pack entry name, NUL-terminated
+  char detail[kDetailSize] = {}; ///< Failure reason, or "" on success
+};
+
+/// \brief Record why a conversion stopped, and return the status.
+///
+/// A failure is never reported as a bare enum the operator cannot act on, so
+/// every exit point goes through here.
+inline Status FailImpl(char* detail, Status status, const char* fmt, ...)
+{
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(detail, kDetailSize, fmt, args);
+  va_end(args);
+  return status;
+}
+
+/// \brief Folds a model's display name down to something a pack entry can hold:
+///        31 characters of [A-Za-z0-9._-], with every run of anything else
+///        collapsed to a single underscore and no underscore at either end.
+///
+/// Truncation can make two long names collide. That is the pack writer's
+/// problem to resolve, not this function's -- it has no view of what is
+/// already stored.
+inline void SanitizeName(const char* src, char* dst, size_t dst_size)
+{
+  size_t out = 0;
+  bool pending_sep = false;
+
+  for (const char* p = src; *p != '\0' && out + 1 < dst_size; p++)
+  {
+    const char c = *p;
+    const bool keep = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.'
+                      || c == '_' || c == '-';
+    if (keep)
+    {
+      if (pending_sep && out > 0 && out + 2 < dst_size)
+        dst[out++] = '_';
+      pending_sep = false;
+      dst[out++] = c;
+    }
+    else if (out > 0)
+    {
+      pending_sep = true;
+    }
+  }
+
+  while (out > 0 && dst[out - 1] == '_')
+    out--;
+
+  dst[out] = '\0';
+}
 
 // =============================================================================
 // SpanWriter

@@ -13,7 +13,7 @@
 # Binaries land in build/tools/ (or build/tools/Release/ with MSVC).
 
 cmake_minimum_required(VERSION 3.15)
-project(namb_tools CXX)
+project(namb_tools C CXX)
 
 # A cross toolchain leaking in here is the mistake this file exists to prevent,
 # so fail loudly rather than silently emitting an unrunnable binary.
@@ -57,6 +57,10 @@ endforeach()
 
 set(NAM_DEPS "${NAM_CORE_ROOT}/Dependencies")
 
+# lwjson, vendored. Only the streaming half is present -- see its README.
+set(LWJSON_DIR "${NAM_DEPS}/lwjson")
+set(LWJSON_SRC "${LWJSON_DIR}/lwjson_stream.c")
+
 # --- nambpack ----------------------------------------------------------------
 # Self-contained: it validates the .namb container and lays out bytes, but never
 # parses a model, so it needs no part of the NAM library and no Eigen. That is
@@ -70,17 +74,16 @@ target_include_directories(nambpack PRIVATE "${NAM_CORE_ROOT}")
 # different bytes.
 #
 # It used to link the whole NAM library and Eigen, for one call into
-# activations::ActivationConfig::from_json. The writer reimplements that mapping
-# -- it has to, being generic over the JSON type -- so all that is needed now is
-# status.cpp, for ToString().
-add_executable(nam2namb nam2namb.cpp "${NAM_CORE_ROOT}/NAM/status.cpp")
+# activations::ActivationConfig::from_json, and then nlohmann for the DOM the
+# writer walked. It needs neither now: the front end streams through lwjson, so
+# this is the tool, the writer, the parser and status.cpp for ToString().
+add_executable(nam2namb nam2namb.cpp "${NAM_CORE_ROOT}/NAM/status.cpp" "${LWJSON_SRC}")
 target_include_directories(nam2namb PRIVATE
     "${NAM_CORE_ROOT}"
-    "${NAM_DEPS}/nlohmann")
+    "${LWJSON_DIR}")
 
 if(MSVC)
     target_compile_definitions(nam2namb PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_compile_options(nam2namb PRIVATE /bigobj)  # nlohmann's DOM templates
 else()
     target_compile_options(nam2namb PRIVATE -Wno-psabi)
 endif()
@@ -111,9 +114,9 @@ enable_testing()
 
 set(NAMB_TESTS_DIR "${CMAKE_CURRENT_LIST_DIR}/../tests")
 
-foreach(_test pack_test pack_writer_test arena_test writer_test)
-    add_executable(${_test} "${NAMB_TESTS_DIR}/${_test}.cpp" "${NAM_CORE_ROOT}/NAM/status.cpp")
-    target_include_directories(${_test} PRIVATE "${NAM_CORE_ROOT}" "${NAM_DEPS}/nlohmann")
+foreach(_test pack_test pack_writer_test writer_test)
+    add_executable(${_test} "${NAMB_TESTS_DIR}/${_test}.cpp" "${NAM_CORE_ROOT}/NAM/status.cpp" "${LWJSON_SRC}")
+    target_include_directories(${_test} PRIVATE "${NAM_CORE_ROOT}" "${NAM_DEPS}/nlohmann" "${LWJSON_DIR}")
 
     # Absolute, so a test can be run from any working directory -- ctest and a
     # hand-run from the bin/ directory both have to find the fixtures.
@@ -129,4 +132,4 @@ foreach(_test pack_test pack_writer_test arena_test writer_test)
     add_test(NAME ${_test} COMMAND ${_test})
 endforeach()
 
-add_custom_target(tests DEPENDS pack_test pack_writer_test arena_test writer_test)
+add_custom_target(tests DEPENDS pack_test pack_writer_test writer_test)

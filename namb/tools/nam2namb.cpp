@@ -27,7 +27,6 @@
 #include <string>
 #include <vector>
 
-#include <json.hpp>
 #include <namb/namb_writer.h>
 
 namespace fs = std::filesystem;
@@ -44,21 +43,6 @@ void usage()
                "  -n, --name <name>    fallback entry name (default: the input's stem)\n"
                "\n"
                "Accepts a SlimmableContainer or a bare WaveNet model.\n");
-}
-
-bool read_file(const fs::path& p, std::vector<char>& out)
-{
-  std::ifstream f(p, std::ios::binary | std::ios::ate);
-  if (!f.is_open())
-    return false;
-  const std::streamoff n = f.tellg();
-  if (n < 0)
-    return false;
-  f.seekg(0, std::ios::beg);
-  out.resize(static_cast<size_t>(n));
-  if (!out.empty())
-    f.read(out.data(), static_cast<std::streamsize>(out.size()));
-  return f.good() || f.eof();
 }
 
 } // namespace
@@ -131,32 +115,47 @@ int main(int argc, char* argv[])
     fallback_name = input_path.stem().string();
   opts.fallback_name = fallback_name.c_str();
 
-  // --- read and parse -------------------------------------------------------
-  std::vector<char> text;
-  if (!read_file(input_path, text))
+  // --- convert, streaming from the file -------------------------------------
+  // Fed exactly the way the pedal feeds it: one byte at a time, no DOM, and no
+  // copy of the document in memory. That is the point of sharing the front end
+  // -- a tool that read the file differently could hit error paths the pedal
+  // never does.
+  std::error_code size_error;
+  const std::uintmax_t source_size = fs::file_size(input_path, size_error);
+  std::ifstream in(input_path, std::ios::binary);
+  if (size_error || !in.is_open())
   {
     std::fprintf(stderr, "nam2namb: cannot read %s\n", input_path.string().c_str());
     return 1;
   }
 
-  // allow_exceptions = false, matching how the firmware parses: the writer is
-  // shared, so the tool exercising a different error path than the pedal would
-  // defeat the point of sharing it.
-  nlohmann::json doc = nlohmann::json::parse(text.begin(), text.end(), nullptr, false);
-  if (doc.is_discarded())
+  struct FileSource
   {
-    std::fprintf(stderr, "nam2namb: %s is not valid JSON\n", input_path.string().c_str());
-    return 1;
-  }
+    std::ifstream& f;
+    size_t read = 0;
 
-  // --- convert --------------------------------------------------------------
+    int get()
+    {
+      const int c = f.get();
+      if (c == std::char_traits<char>::eof())
+        return -1;
+      read++;
+      return c & 0xFF;
+    }
+  };
+
   // A float costs four bytes here and never fewer than six characters as JSON,
   // and the config block is small beside the weights, so the source length plus
   // a fixed margin is always enough.
-  std::vector<uint8_t> blob(text.size() + 64 * 1024);
+  std::vector<uint8_t> blob(static_cast<size_t>(source_size) + 64 * 1024);
 
+  // Static: ~16 KB, which is more than belongs on a stack frame even on a host.
+  static nam::namb::StreamConverter converter;
+
+  FileSource src{in};
   nam::namb::WriteResult result;
-  const nam::Status status = nam::namb::WriteNamb(doc, blob.data(), blob.size(), result, opts);
+  const nam::Status status =
+    nam::namb::WriteNambStream(src, blob.data(), blob.size(), result, opts, converter);
   if (!nam::IsOk(status))
   {
     std::fprintf(stderr, "nam2namb: %s\n", result.detail);
@@ -180,9 +179,9 @@ int main(int argc, char* argv[])
   out.close();
 
   // --- report ---------------------------------------------------------------
-  const double reduction = 100.0 * (1.0 - static_cast<double>(result.size) / static_cast<double>(text.size()));
+  const double reduction = 100.0 * (1.0 - static_cast<double>(result.size) / static_cast<double>(source_size));
   std::printf("%s -> %s\n", input_path.filename().string().c_str(), output_path.filename().string().c_str());
-  std::printf("  JSON: %zu bytes\n", text.size());
+  std::printf("  JSON: %ju bytes (%zu read)\n", source_size, src.read);
   std::printf("  NAMB: %zu bytes\n", result.size);
   std::printf("  Reduction: %.1f%%\n", reduction);
   std::printf("  %u weights, %u channels, entry name \"%s\"\n", result.weight_count,
