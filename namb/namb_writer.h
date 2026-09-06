@@ -56,6 +56,22 @@ extern "C" {
 #include "lwjson/lwjson.h"
 }
 
+// The deepest path this grammar reaches is an activation object's key inside an
+// activation array inside a layer array inside a container's submodel:
+//
+//   root > config > submodels > [i] > model > config > layers > [j]
+//        > activation > [k] > type
+//
+// Every key occupies a stack entry of its own alongside its object or array, so
+// that bottoms out at 17. lwjson's default is 16, and overflowing it is not a
+// loud failure -- prv_stack_push returns 0, the parse comes back lwjsonERRMEM,
+// and every container on the card reports "not valid JSON". So the setting in
+// Dependencies/lwjson/lwjson/lwjson_opts.h is load-bearing, and a build that
+// does not pick that file up has to fail here rather than at run time.
+static_assert(LWJSON_CFG_STREAM_STACK_SIZE >= 24,
+              "lwjson stack is too shallow for a SlimmableContainer -- is lwjson_opts.h on the "
+              "include path? See NAMCoreN6/Dependencies/lwjson/README.md.");
+
 namespace nam
 {
 namespace namb
