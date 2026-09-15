@@ -9,7 +9,9 @@
 // Flash map (STM32N6 / W25Q, XSPI1 memory-mapped at 0x90000000):
 //
 //   0x90200000  +--------------------------+
-//               |  model pack   (6 MiB)    |  <- this format
+//               |  model pack   (3 MiB)    |  <- this format
+//   0x90500000  +--------------------------+
+//               |  IR pack      (3 MiB)    |  <- irpack_format.h, same design
 //   0x90800000  +--------------------------+
 //               |  user data   (24 MiB)    |  <- logs, recordings, LUTs
 //   0x92000000  +--------------------------+
@@ -72,10 +74,10 @@ static constexpr uint16_t FORMAT_VERSION = 2;
 /// \brief Base address of the pack in the memory-mapped XSPI1 window.
 static constexpr uint32_t FLASH_BASE = 0x90200000u;
 
-/// \brief Bytes reserved for the pack. The region after this belongs to user
-///        data; a pack that would exceed it must be rejected by the tool rather
-///        than silently overwriting logs and recordings.
-static constexpr uint32_t REGION_SIZE = 6u * 1024u * 1024u;
+/// \brief Bytes reserved for the pack. The region after this belongs to the IR
+///        pack; a pack that would exceed it must be rejected by the tool rather
+///        than silently overwriting it.
+static constexpr uint32_t REGION_SIZE = 3u * 1024u * 1024u;
 
 /// \brief Erase granularity of the W25Q. Blobs are aligned to this so a single
 ///        model can be replaced with a sector erase instead of rewriting the
@@ -161,6 +163,21 @@ static_assert(sizeof(Header) + MAX_ENTRIES * sizeof(Entry) <= TOC_SLOT_SIZE,
               "nambpack: MAX_ENTRIES no longer fits in a TOC slot -- grow TOC_SLOT_SIZE");
 
 static_assert(FIRST_BLOB_OFFSET < REGION_SIZE, "nambpack: the TOC area fills the whole pack region");
+
+/// \brief Blob size the region is sized against. NOT a limit anything enforces
+///        -- Add() already fails when the free space runs out -- but the
+///        assumption the REGION_SIZE arithmetic rests on.
+///
+/// An A2-Lite .namb lands a little over 8 KiB, and ModelLibrary stages into a
+/// 16 KiB buffer, so this is already double what the largest shipping model
+/// needs. Stated as a constant so the sizing argument for a 3 MiB region is
+/// checkable here rather than being a remark in a commit message.
+static constexpr uint32_t NOMINAL_MAX_BLOB_SIZE = 16u * 1024u;
+
+static_assert(FIRST_BLOB_OFFSET + MAX_ENTRIES * NOMINAL_MAX_BLOB_SIZE <= REGION_SIZE,
+              "nambpack: a full pack of nominal-sized models no longer fits the region. "
+              "Either REGION_SIZE shrank again or MAX_ENTRIES grew -- and the space "
+              "immediately above this region belongs to the IR pack, not to slack.");
 
 static_assert(HEADER_CRC_OFFSET + HEADER_CRC_SIZE <= sizeof(Header),
               "nambpack: the header checksum field must lie inside the header");
