@@ -1,5 +1,14 @@
 #pragma once
 
+/**
+ * \file    a2_fast.h
+ * \brief   Specialised A2 WaveNet fast path (Channels 3/8): shape detection,
+ *          kernels, and weight/scratch arenas.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \author  Claude
+ * \date    2026-04-20
+ */
 // Specialized WaveNet fast path for the A2-Full (Channels=8) and
 // A2-Lite (Channels=3) models. Shares the same architecture shape; only
 // the channel count differs.
@@ -23,6 +32,11 @@ namespace wavenet
 {
 namespace a2_fast
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 /// \brief Number of layers in an A2 layer array.
 constexpr int kNumLayers = 23;
@@ -199,6 +213,8 @@ struct WeightArena
 /// A model captures the arena at construction and uses that same one to
 /// release, so changing this later cannot strand an existing model's block.
 void SetWeightArena(const WeightArena* arena);
+
+/** \} */ // nam
 
 } // namespace a2_fast
 } // namespace wavenet

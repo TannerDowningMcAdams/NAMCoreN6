@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * \file    nambpack_format.h
+ * \brief   Model pack (.nambpack) layout: dual TOC slots, sector-aligned blobs,
+ *          and their checksums.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-27
+ */
 // Model pack (.nambpack): two redundant tables of contents plus N .namb blobs,
 // programmed to external flash as one image and read in place.
 //
@@ -63,6 +71,11 @@ namespace nam
 {
 namespace nambpack
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 /// \brief Magic number: "NMPK" as a little-endian uint32.
 static constexpr uint32_t MAGIC = 0x4B504D4Eu;
@@ -227,6 +240,8 @@ inline bool SequenceNewer(uint32_t a, uint32_t b)
 {
   return static_cast<int32_t>(a - b) > 0;
 }
+
+/** \} */ // nam
 
 } // namespace nambpack
 } // namespace nam

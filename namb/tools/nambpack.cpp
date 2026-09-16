@@ -1,3 +1,10 @@
+/**
+ * \file    nambpack.cpp
+ * \brief   Host tool: combine .namb models into one .nambpack flash image.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-27
+ */
 // nambpack: combine .namb models into one flash image for the model-pack region.
 //
 // Usage:

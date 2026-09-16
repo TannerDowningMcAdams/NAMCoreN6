@@ -1,4 +1,11 @@
 #pragma once
+/**
+ * \file    namb_writer.h
+ * \brief   Streaming .nam (JSON) to .namb converter, no DOM.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-09-04
+ */
 // .nam (JSON) -> .namb (binary), without building a DOM.
 //
 // Reads the source a character at a time through lwjson's streaming parser,
@@ -76,6 +83,11 @@ namespace nam
 {
 namespace namb
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 namespace stream_detail
 {
@@ -2090,6 +2102,8 @@ Status WriteNambStream(Source& src, uint8_t* out, size_t capacity, WriteResult& 
 
   return conv.finish();
 }
+
+/** \} */ // nam
 
 } // namespace namb
 } // namespace nam

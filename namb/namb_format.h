@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * \file    namb_format.h
+ * \brief   The .namb container: version constants, CRC helpers, and the
+ *          BinaryReader / BinaryWriter.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-26
+ */
 // Compact binary model format (.namb) for NAM
 // Format version 2 - no external dependencies required for reading
 //
@@ -40,6 +48,11 @@ namespace nam
 {
 namespace namb
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 // Magic number: "NAMB" as little-endian uint32
 static constexpr uint32_t MAGIC = 0x4E414D42;
@@ -112,6 +125,7 @@ inline uint32_t compute_file_crc32(const uint8_t* data, size_t size)
 // BinaryReader - reads from a memory buffer with bounds checking
 // =============================================================================
 
+/** \brief Reads little-endian scalars from a memory buffer with bounds checking. */
 class BinaryReader
 {
 public:
@@ -228,6 +242,7 @@ private:
 // BinaryWriter - builds a byte buffer
 // =============================================================================
 
+/** \brief Builds a .namb byte buffer, little-endian. */
 class BinaryWriter
 {
 public:
@@ -283,6 +298,8 @@ public:
 private:
   std::vector<uint8_t> _data;
 };
+
+/** \} */ // nam
 
 } // namespace namb
 } // namespace nam

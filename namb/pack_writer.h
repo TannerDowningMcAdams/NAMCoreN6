@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * \file    pack_writer.h
+ * \brief   Pack write engine: power-safe add/remove/format over a FlashOps back
+ *          end.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-09-04
+ */
 // Write side of the model pack: add, replace and remove models in place.
 //
 // A commit programs the blob into free space, then rewrites the INACTIVE TOC
@@ -23,6 +31,11 @@ namespace nam
 {
 namespace nambpack
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 /// Flash back end. Addresses are raw chip offsets; \p base is where the pack
 /// appears in the memory map.
@@ -64,6 +77,7 @@ struct TocImage
 
 static_assert(sizeof(TocImage) == sizeof(Header) + MAX_ENTRIES * sizeof(Entry), "TocImage must be contiguous");
 
+/** \brief Pack write engine: stages the live TOC, then commits blob and TOC power-safely. */
 class PackWriter
 {
 public:
@@ -388,6 +402,8 @@ private:
   uint32_t _sequence = 0;
   uint8_t _next_slot = 0;
 };
+
+/** \} */ // nam
 
 } // namespace nambpack
 } // namespace nam

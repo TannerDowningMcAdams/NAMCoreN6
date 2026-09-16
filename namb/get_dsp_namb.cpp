@@ -1,3 +1,10 @@
+/**
+ * \file    get_dsp_namb.cpp
+ * \brief   Binary .namb loader implementation over the shared create_dsp() path.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-26
+ */
 // Binary .namb loader for NAM models
 // Uses the unified create_dsp() path shared with the JSON loader
 

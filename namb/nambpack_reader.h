@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * \file    nambpack_reader.h
+ * \brief   Validated, non-owning read view of a .nambpack image in
+ *          memory-mapped flash.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-27
+ */
 // Read-side view of a model pack sitting in memory-mapped flash. Turns the raw
 // bytes at FLASH_BASE into validated Entry records and hands back pointers into
 // that same window; nothing is copied out, since get_dsp_namb() parses through
@@ -35,6 +43,11 @@ namespace nam
 {
 namespace nambpack
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 /// \brief Validated, non-owning view of a pack image.
 ///
@@ -241,6 +254,8 @@ private:
   uint32_t _sequence = 0;
   uint8_t _slot = 0;
 };
+
+/** \} */ // nam
 
 } // namespace nambpack
 } // namespace nam

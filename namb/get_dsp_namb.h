@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * \file    get_dsp_namb.h
+ * \brief   Binary .namb loader entry points: buffer and file, with and without
+ *          exceptions.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-26
+ */
 // Binary .namb loader for NAM models
 // No dependency on nlohmann/json - suitable for embedded targets
 
@@ -14,6 +22,11 @@
 
 namespace nam
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 /// \brief Load a NAM model from a .namb buffer, reporting failure by status.
 ///
@@ -46,5 +59,7 @@ std::unique_ptr<DSP> get_dsp_namb(const uint8_t* data, size_t size);
 std::unique_ptr<DSP> get_dsp_namb(const std::filesystem::path& filename);
 
 #endif // !NAM_NO_EXCEPTIONS
+
+/** \} */ // nam
 
 } // namespace nam

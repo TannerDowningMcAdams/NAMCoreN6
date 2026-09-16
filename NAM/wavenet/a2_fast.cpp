@@ -1,3 +1,11 @@
+/**
+ * \file    a2_fast.cpp
+ * \brief   A2 fast path implementation: reference and MVE frame-major kernels.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \author  Claude
+ * \date    2026-04-20
+ */
 #if defined(NAM_ENABLE_A2_FAST)
 
   // Ring-buffer strategy:

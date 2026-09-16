@@ -1,4 +1,12 @@
 #pragma once
+/**
+ * \file    namb_config.h
+ * \brief   Plain-struct model configuration and the byte emitters that lay out
+ *          .namb.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-09-05
+ */
 // The seam between "read a model description" and "lay out .namb bytes".
 //
 // Everything here is plain structs and the code that turns them into bytes.
@@ -33,6 +41,11 @@ namespace nam
 {
 namespace namb
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 /// \brief Largest dilation count a layer array may declare. Not an arbitrary
 ///        cap: num_dilations is a uint8 in the container, so 255 is the
@@ -540,6 +553,8 @@ inline bool EmitModelBlockClose(SpanWriter& w, const ModelBlockPatch& patch, siz
   w.set_u16(patch.config_size_offset, static_cast<uint16_t>(size));
   return true;
 }
+
+/** \} */ // nam
 
 } // namespace namb
 } // namespace nam

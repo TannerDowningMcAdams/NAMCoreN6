@@ -1,4 +1,11 @@
 #pragma once
+/**
+ * \file    binary_parser_registry.h
+ * \brief   Registry mapping .namb architecture IDs to binary config parsers.
+ * \ingroup nam
+ * \author  Tanner Downing-McAdams
+ * \date    2026-08-26
+ */
 // Binary config parser registry for .namb format
 // Mirrors ConfigParserRegistry from model_config.h but maps uint8_t architecture IDs
 // to binary parser functions instead of string names to JSON parsers.
@@ -23,6 +30,11 @@ namespace nam
 {
 namespace namb
 {
+
+/**
+ * \addtogroup nam
+ * \{
+ */
 
 using BinaryConfigParserFunction = std::function<std::unique_ptr<ModelConfig>(
     BinaryReader& reader, const float*& weights, size_t& weight_count, const ModelMetadata& meta,
@@ -75,6 +87,8 @@ struct BinaryConfigParserHelper
     BinaryConfigParserRegistry::instance().registerParser(arch_id, std::move(func));
   }
 };
+
+/** \} */ // nam
 
 } // namespace namb
 } // namespace nam
