@@ -57,6 +57,12 @@ public:
   bool has(uint8_t arch_id) const { return parsers_.find(arch_id) != parsers_.end(); }
 
   /// \brief Dispatch to the parser registered for arch_id.
+  /// \param arch_id        Architecture id from the .namb model block.
+  /// \param reader         Positioned at the architecture's config bytes.
+  /// \param weights        Out: set to the start of the weight array.
+  /// \param weight_count   Out: number of weights.
+  /// \param meta           Parsed model metadata.
+  /// \param format_version .namb format version, for version-dependent fields.
   /// \param status Set to ErrorUnknownArchitecture when no parser is registered,
   ///               left untouched otherwise. Never throws, so the same registry
   ///               serves builds compiled without exceptions; the caller decides

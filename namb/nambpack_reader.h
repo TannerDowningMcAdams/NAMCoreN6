@@ -182,6 +182,9 @@ public:
   /// writer wants to know whether the slot it is about to overwrite was the
   /// one carrying the live index.
   ///
+  /// \param base         Start of the pack image.
+  /// \param region_size  Bytes the pack may occupy.
+  /// \param slot         TOC slot index to validate.
   /// \param sequence_out Set to the slot's commit counter on success.
   static Status ValidateSlot(const uint8_t* base, uint32_t region_size, uint8_t slot, uint32_t& sequence_out)
   {
