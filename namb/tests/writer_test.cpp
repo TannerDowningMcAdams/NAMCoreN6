@@ -24,6 +24,12 @@
 //   a2_lite.nam        the bare ch3 submodel, which must NOT acquire those
 //                      fields -- the two goldens differ in meta_flags and in
 //                      the two level doubles, and that difference is the fold
+//   a2_container_config_first.nam
+//                      a2_container.nam with its root keys reordered as text
+//                      the way TONE3000 exports them: "config" first,
+//                      "architecture" last. Same values, so same goldens; the
+//                      container has to be recognised from config.submodels
+//                      before anything says so
 //
 //   writer_test                            the checked-in fixtures
 //   writer_test <model.nam> <expected.namb> [...]   a real model pack pair
@@ -137,6 +143,7 @@ int main(int argc, char** argv)
     pairs = {
       data + "/fixtures/a2_container.nam", data + "/golden/a2_container_ch3.namb",
       data + "/fixtures/a2_lite.nam",      data + "/golden/a2_lite.namb",
+      data + "/fixtures/a2_container_config_first.nam", data + "/golden/a2_container_ch3.namb",
     };
   }
   else
@@ -240,6 +247,14 @@ int main(int argc, char** argv)
       {R"({"config":{}})", "missing architecture is refused"},
       {R"({"architecture":"WaveNet"})", "WaveNet with no config is refused"},
       {R"({"architecture":"SlimmableContainer","config":{"submodels":[]}})", "empty container is refused"},
+      {R"({"config":{"submodels":[]},"architecture":"SlimmableContainer"})",
+       "empty container is refused, architecture last"},
+      {R"({"architecture":"WaveNet","config":{"submodels":[]}})", "WaveNet holding submodels is refused"},
+      {R"({"config":{"submodels":[{"model":{"architecture":"WaveNet","version":"1.0.0","config":{"layers":[{)"
+       R"("input_size":1,"condition_size":1,"channels":3,"dilations":[1],"kernel_sizes":[3],)"
+       R"("head":{"out_channels":1,"kernel_size":1,"bias":true},"activation":"Tanh"}]},"weights":[1.0]},)"
+       R"("max_value":1}]},"architecture":"WaveNet"})",
+       "WaveNet holding submodels is refused, architecture last"},
       {R"({"architecture":"WaveNet","version":"1.0.0","config":{"layers":[]}})", "empty layers is refused"},
       {R"({"architecture":"WaveNet","version":"1.0.0","config":{"layers":[{"input_size":1,)"
        R"("condition_size":1,"channels":3,"dilations":[1,2],"kernel_sizes":[3],)"

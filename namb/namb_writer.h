@@ -348,6 +348,7 @@ private:
   void onValue(lwjson_stream_type_t type);
 
   void enterModel(size_t model_key);
+  void becomeContainer();
   void endModel();
   void beginLayer();
   void endLayer();
@@ -402,6 +403,7 @@ private:
   size_t layer_key_ = stream_detail::kNoAnchor;
 
   bool is_container_ = false;
+  bool root_is_wavenet_ = false; ///< root.architecture said "WaveNet"
   bool skip_model_ = false; ///< This submodel is not the one asked for
   bool decided_ = false; ///< The chosen model has been settled on
   bool model_done_ = false; ///< The chosen model's object has closed
@@ -587,6 +589,7 @@ inline Status StreamConverter::begin(uint8_t* out, size_t capacity, const WriteO
   layer_key_ = stream_detail::kNoAnchor;
 
   is_container_ = false;
+  root_is_wavenet_ = false;
   skip_model_ = false;
   decided_ = false;
   model_done_ = false;
@@ -707,12 +710,27 @@ inline void StreamConverter::enterModel(size_t model_key)
   block_closed_ = false;
 }
 
+// The root was provisionally the model; it is a wrapper after all. What was
+// captured as the model's own is the container's -- the root metadata path
+// kept a copy in outer_ -- and the submodels supply their own.
+inline void StreamConverter::becomeContainer()
+{
+  is_container_ = true;
+  inner_ = MetaCapture{};
+  version_set_ = false;
+  model_key_ = stream_detail::kNoAnchor;
+  cfg_key_ = stream_detail::kNoAnchor;
+  layers_arr_ = stream_detail::kNoAnchor;
+  layer_key_ = stream_detail::kNoAnchor;
+}
+
 inline void StreamConverter::onObjectStart()
 {
   const size_t p = depth();
 
   // The root. Provisionally the model too: a bare WaveNet document is its own
-  // model, and if "architecture" later says SlimmableContainer we undo this.
+  // model, and if root.config.submodels or "architecture" later says it is a
+  // SlimmableContainer, becomeContainer() undoes this.
   if (p == 0)
   {
     enterModel(1);
@@ -842,9 +860,23 @@ inline void StreamConverter::onArrayStart()
 {
   const size_t p = depth();
 
-  // root.config.submodels
-  if (is_container_ && p == 4 && isKey(3, "submodels") && isKey(1, "config"))
+  // root.config.submodels. A WaveNet config has no such member, so its presence
+  // is itself the evidence of a container -- which matters because "architecture"
+  // is not promised to come first: TONE3000 exports put root "config" first and
+  // "architecture" last. Left to the provisional bare-model anchors, this array
+  // sits exactly where root.config.layers would, and each submodel entry gets
+  // parsed as a layer array.
+  if (p == 4 && isKey(3, "submodels") && isKey(1, "config"))
   {
+    if (!is_container_)
+    {
+      if (root_is_wavenet_)
+      {
+        fail(Status::ErrorInvalidConfig, "architecture is 'WaveNet' but config holds 'submodels'");
+        return;
+      }
+      becomeContainer();
+    }
     submodels_arr_ = p;
     return;
   }
@@ -1097,19 +1129,21 @@ inline bool StreamConverter::routeRootValue(lwjson_stream_type_t type)
 
     if (std::strcmp(str(), "SlimmableContainer") == 0)
     {
-      is_container_ = true;
-      // What was captured as the model's own is the container's after all; the
-      // submodels supply their own. The two copies were kept in step precisely
-      // so this costs nothing -- "architecture" follows "metadata" in every
-      // model on hand, and JSON does not promise otherwise.
-      inner_ = MetaCapture{};
-      version_set_ = false;
-      model_key_ = stream_detail::kNoAnchor;
-      cfg_key_ = stream_detail::kNoAnchor;
-      layers_arr_ = stream_detail::kNoAnchor;
-      layer_key_ = stream_detail::kNoAnchor;
+      // Seeing root.config.submodels may already have settled this, and by now
+      // the anchors belong to a submodel -- possibly the one being written --
+      // so resetting them again would lose it. Otherwise the root's provisional
+      // capture is the container's; the two copies were kept in step precisely
+      // so switching costs nothing, wherever "architecture" falls.
+      if (!is_container_)
+        becomeContainer();
     }
-    else if (std::strcmp(str(), "WaveNet") != 0)
+    else if (std::strcmp(str(), "WaveNet") == 0)
+    {
+      if (is_container_)
+        fail(Status::ErrorInvalidConfig, "architecture is 'WaveNet' but config holds 'submodels'");
+      root_is_wavenet_ = true;
+    }
+    else
     {
       fail(Status::ErrorUnknownArchitecture,
            "architecture '%s' is not supported; expected WaveNet or SlimmableContainer", str());
